@@ -18,23 +18,18 @@ Integracja korzysta  z nowego endpointu `unified-metrics` dla:
 - zużycia energii
 - kosztów i bilansu
 
-## Funkcje  
-- Aktualna cena kupna i sprzedaży energii  
-- Tabela 24h z prognozowanymi cenami dla sensora API  
-- Tabela 48h z prognozowanymi cenami dla sensora MQTT  
-- Konfigurowalna liczba "najlepszych godzin"  
-- Konfigurowalna liczba "najgorszych godzin"  
-- Cena w następnej godzinie  
-- Średnia cena z pozostałej ilości godzin do końca doby  
-- Średnia cena wschód/zachód  
-- Automatyczna konwersja czasu UTC → lokalny  
-- Dane są aktualizowane minutę po pełnej godzinie  
-- Konfiguracja z poziomu integracji  
-- Walidacja klucza API / Cache danych / Zabezpieczenie przed timeoutem API  
-- Integracja wystawia po lokalnym MQTT tablice cen w natywnym formacie EVCC  
-- Średnia zakupu oraz sprzedaży - miesięczna/roczna  
-- Bilans miesięczny/roczny  
-- Debug i logowanie  
+## Funkcje
+- Aktualna cena kupna energii (PLN/kWh, bieżąca godzina)
+- Tabela 24h / 48h z prognozowanymi cenami
+- Konfigurowalna liczba "najlepszych" i "najgorszych" godzin
+- Cena w następnej godzinie, średnia dzienna, średnia wschód/zachód
+- Aktualne zużycie energii (W) pobierane z lokalnego licznika co 30s
+- Automatyczna konwersja czasu UTC → lokalny
+- Dane cenowe aktualizowane minutę po pełnej godzinie
+- Konfiguracja z poziomu integracji (klucz API + adres URL licznika)
+- Walidacja klucza API / Cache danych / Zabezpieczenie przed timeoutem API
+- Opcjonalne wystawianie taryf przez MQTT w formacie EVCC
+- Debug i logowanie
 
 
 ## Instalacja
@@ -67,11 +62,10 @@ Folder `Legacy Comparison` zostawiłem do ręcznego porównywania odpowiedzi ze 
 ## Konfiguracja
 1. Przejdź do `Ustawienia` → `Urządzenia i usługi`
 2. Kliknij `Dodaj integrację`
-3. Wyszukaj "Psrryk Energy"
+3. Wyszukaj "Pstryk Energy"
 4. Wprowadź dane:
-- **Klucz API**: Twój klucz z platformy Pstryk
-- **Liczba najlepszych cen kupna**: (domyślnie 5)
-- **Liczba najlepszych cen sprzedaży**: (domyślnie 5)
+   - **Klucz API**: Twój klucz z platformy Pstryk
+   - **Meter URL**: Adres lokalnego licznika energii (np. `http://192.168.1.49/state`)
 
 ## Scrnshoty
 
@@ -87,17 +81,10 @@ Folder `Legacy Comparison` zostawiłem do ręcznego porównywania odpowiedzi ze 
 ## Użycie
 ### Dostępne encje
 
-| Nazwa encji                             | Opis                                         |
-|-----------------------------------------|----------------------------------------------|
-| `sensor.pstryk_current_buy_price`       | Aktualna cena kupna energii + tabela         |
-| `sensor.pstryk_current_sell_price`      | Aktualna cena sprzedaży energii + tabela     |
-| `sensor.pstryk_buy_monthly_average`     | Średnia miesięczna cena kupna energii        |
-| `sensor.pstryk_buy_yearly_average`      | Średnia roczna cena kupna energii            |
-| `sensor.pstryk_sell_monthly_average`    | Średnia miesięczna cena sprzedaży energii    |
-| `sensor.pstryk_sell_yearly_average`     | Średnia roczna cena sprzedaży energii        |
-| `sensor.pstryk_daily_financial_balance` | Dzienny bilans kupna/sprzedaży               |
-| `sensor.pstryk_monthly_financial_balance`| Miesięczny bilans kupna/sprzedaży            |
-| `sensor.pstryk_yearly_financial_balance` | Roczny bilans kupna/sprzedaży                |
+| Nazwa encji                       | Opis                                                  |
+|-----------------------------------|-------------------------------------------------------|
+| `sensor.pstryk_current_buy_price` | Aktualna cena kupna energii (PLN/kWh) + tabela cen   |
+| `sensor.pstryk_current_power`     | Aktualne zużycie energii (W) z lokalnego licznika    |
 
 
 Przykładowa Automatyzacja:
