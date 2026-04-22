@@ -26,7 +26,9 @@ from .const import (
     MIN_RETRY_ATTEMPTS,
     MAX_RETRY_ATTEMPTS,
     MIN_RETRY_DELAY,
-    MAX_RETRY_DELAY
+    MAX_RETRY_DELAY,
+    CONF_METER_URL,
+    DEFAULT_METER_URL,
 )
 
 class MQTTNotConfiguredError(HomeAssistantError):
@@ -49,9 +51,10 @@ class PstrykConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             # Validate API key
             api_key = user_input["api_key"]
             valid = await self._validate_api_key(api_key)
-            
+
             if valid:
                 self._data["api_key"] = api_key
+                self._data[CONF_METER_URL] = user_input[CONF_METER_URL]
                 # Move to price settings step
                 return await self.async_step_price_settings()
             else:
@@ -61,6 +64,7 @@ class PstrykConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             step_id="user",
             data_schema=vol.Schema({
                 vol.Required("api_key"): str,
+                vol.Required(CONF_METER_URL, default=DEFAULT_METER_URL): str,
             }),
             errors=errors
         )
@@ -252,13 +256,15 @@ class PstrykOptionsFlowHandler(config_entries.OptionsFlow):
                     CONF_MQTT_48H_MODE, False)): bool,
             })
         
-        # API Configuration
+        # Local meter + API Configuration
         schema.update({
+            vol.Required(CONF_METER_URL, default=self.config_entry.options.get(
+                CONF_METER_URL, self.config_entry.data.get(CONF_METER_URL, DEFAULT_METER_URL))): str,
             vol.Optional(CONF_RETRY_ATTEMPTS, default=self.config_entry.options.get(
-                CONF_RETRY_ATTEMPTS, DEFAULT_RETRY_ATTEMPTS)): 
+                CONF_RETRY_ATTEMPTS, DEFAULT_RETRY_ATTEMPTS)):
                     vol.All(vol.Coerce(int), vol.Range(min=MIN_RETRY_ATTEMPTS, max=MAX_RETRY_ATTEMPTS)),
             vol.Optional(CONF_RETRY_DELAY, default=self.config_entry.options.get(
-                CONF_RETRY_DELAY, DEFAULT_RETRY_DELAY)): 
+                CONF_RETRY_DELAY, DEFAULT_RETRY_DELAY)):
                     vol.All(vol.Coerce(int), vol.Range(min=MIN_RETRY_DELAY, max=MAX_RETRY_DELAY)),
         })
 

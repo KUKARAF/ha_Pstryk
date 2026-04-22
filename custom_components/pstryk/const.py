@@ -29,6 +29,10 @@ CONF_MQTT_TOPIC_BUY = "mqtt_topic_buy"
 CONF_MQTT_TOPIC_SELL = "mqtt_topic_sell"
 CONF_MQTT_48H_MODE = "mqtt_48h_mode"
 
+# Local power meter
+CONF_METER_URL = "meter_url"
+DEFAULT_METER_URL = "http://192.168.1.49/state"
+
 # Retry mechanism constants
 CONF_RETRY_ATTEMPTS = "retry_attempts"
 CONF_RETRY_DELAY = "retry_delay"

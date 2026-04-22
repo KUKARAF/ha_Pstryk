@@ -1,15 +1,13 @@
 """Sensor platform for Pstryk Energy integration."""
 import logging
-import asyncio
 from datetime import timedelta
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.components.sensor import SensorEntity, SensorStateClass, SensorDeviceClass
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
-from homeassistant.helpers.restore_state import RestoreEntity
+from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.util import dt as dt_util
 from .update_coordinator import PstrykDataUpdateCoordinator
-from .energy_cost_coordinator import PstrykCostDataUpdateCoordinator
 from .api_client import PstrykAPIClient
 from .const import (
     DOMAIN,
@@ -17,7 +15,9 @@ from .const import (
     CONF_RETRY_ATTEMPTS,
     CONF_RETRY_DELAY,
     DEFAULT_RETRY_ATTEMPTS,
-    DEFAULT_RETRY_DELAY
+    DEFAULT_RETRY_DELAY,
+    CONF_METER_URL,
+    DEFAULT_METER_URL,
 )
 from homeassistant.helpers.translation import async_get_translations
 
@@ -57,15 +57,11 @@ async def async_setup_entry(
     """Set up the Pstryk sensors via the coordinator."""
     api_key = hass.data[DOMAIN][entry.entry_id]["api_key"]
     buy_top = entry.options.get("buy_top", entry.data.get("buy_top", 5))
-    sell_top = entry.options.get("sell_top", entry.data.get("sell_top", 5))
     buy_worst = entry.options.get("buy_worst", entry.data.get("buy_worst", 5))
-    sell_worst = entry.options.get("sell_worst", entry.data.get("sell_worst", 5))
+    meter_url = entry.options.get(CONF_METER_URL, entry.data.get(CONF_METER_URL, DEFAULT_METER_URL))
     mqtt_48h_mode = entry.options.get(CONF_MQTT_48H_MODE, False)
     retry_attempts = entry.options.get(CONF_RETRY_ATTEMPTS, DEFAULT_RETRY_ATTEMPTS)
     retry_delay = entry.options.get(CONF_RETRY_DELAY, DEFAULT_RETRY_DELAY)
-
-    _LOGGER.debug("Setting up Pstryk sensors with buy_top=%d, sell_top=%d, buy_worst=%d, sell_worst=%d, mqtt_48h_mode=%s, retry_attempts=%d, retry_delay=%ds", 
-                 buy_top, sell_top, buy_worst, sell_worst, mqtt_48h_mode, retry_attempts, retry_delay)
 
     # Load translations once for all sensors
     global _TRANSLATIONS_CACHE
@@ -78,32 +74,15 @@ async def async_setup_entry(
             _LOGGER.warning("Failed to load translations: %s", ex)
             _TRANSLATIONS_CACHE = {}
 
-    # Cleanup old coordinators if they exist
-    for price_type in ("buy", "sell"):
-        key = f"{entry.entry_id}_{price_type}"
-        coordinator = hass.data[DOMAIN].get(key)
-        if coordinator:
-            _LOGGER.debug("Cleaning up existing %s coordinator", price_type)
-            # Cancel scheduled updates
-            if hasattr(coordinator, '_unsub_hourly') and coordinator._unsub_hourly:
-                coordinator._unsub_hourly()
-            if hasattr(coordinator, '_unsub_midnight') and coordinator._unsub_midnight:
-                coordinator._unsub_midnight()
-            if hasattr(coordinator, '_unsub_afternoon') and coordinator._unsub_afternoon:
-                coordinator._unsub_afternoon()
-            # Remove from hass data
-            hass.data[DOMAIN].pop(key, None)
-
-    # Cleanup old cost coordinator if exists
-    cost_key = f"{entry.entry_id}_cost"
-    cost_coordinator = hass.data[DOMAIN].get(cost_key)
-    if cost_coordinator:
-        _LOGGER.debug("Cleaning up existing cost coordinator")
-        if hasattr(cost_coordinator, '_unsub_hourly') and cost_coordinator._unsub_hourly:
-            cost_coordinator._unsub_hourly()
-        if hasattr(cost_coordinator, '_unsub_midnight') and cost_coordinator._unsub_midnight:
-            cost_coordinator._unsub_midnight()
-        hass.data[DOMAIN].pop(cost_key, None)
+    # Cleanup old buy coordinator if it exists
+    buy_key = f"{entry.entry_id}_buy"
+    existing = hass.data[DOMAIN].get(buy_key)
+    if existing:
+        for attr in ('_unsub_hourly', '_unsub_midnight', '_unsub_afternoon'):
+            unsub = getattr(existing, attr, None)
+            if unsub:
+                unsub()
+        hass.data[DOMAIN].pop(buy_key, None)
 
     # Create shared API client (or reuse existing one)
     api_client_key = f"{entry.entry_id}_api_client"
@@ -113,152 +92,28 @@ async def async_setup_entry(
     else:
         api_client = hass.data[DOMAIN][api_client_key]
 
-    entities = []
-    coordinators = []
-
-    # Create price coordinators first
-    for price_type in ("buy", "sell"):
-        key = f"{entry.entry_id}_{price_type}"
-        coordinator = PstrykDataUpdateCoordinator(
-            hass,
-            api_client,
-            price_type,
-            mqtt_48h_mode,
-            retry_attempts,
-            retry_delay
-        )
-        coordinators.append((coordinator, price_type, key))
-
-    # Create cost coordinator (will be initialized as unavailable for lazy loading)
-    cost_coordinator = PstrykCostDataUpdateCoordinator(
-        hass,
-        api_client,
-        retry_attempts,
-        retry_delay
+    # Create buy price coordinator
+    buy_coordinator = PstrykDataUpdateCoordinator(
+        hass, api_client, "buy", mqtt_48h_mode, retry_attempts, retry_delay
     )
-    cost_coordinator.last_update_success = False
-    coordinators.append((cost_coordinator, "cost", cost_key))
+    try:
+        data = await buy_coordinator._async_update_data()
+        buy_coordinator.data = data
+        buy_coordinator.last_update_success = True
+    except Exception as err:
+        _LOGGER.error("Failed initial fetch for buy coordinator: %s", err)
+        buy_coordinator.last_update_success = False
 
-    # Initialize ONLY price coordinators immediately (fast startup)
-    # Cost coordinator will be loaded lazily in background
-    _LOGGER.info("Starting quick initialization - loading price coordinators only")
+    hass.data[DOMAIN][buy_key] = buy_coordinator
+    buy_coordinator.schedule_hourly_update()
+    buy_coordinator.schedule_midnight_update()
+    if mqtt_48h_mode:
+        buy_coordinator.schedule_afternoon_update()
 
-    async def safe_initial_fetch(coord, coord_type):
-        """Safely fetch initial data for coordinator."""
-        try:
-            data = await coord._async_update_data()
-            coord.data = data
-            coord.last_update_success = True
-            _LOGGER.debug("Successfully initialized %s coordinator", coord_type)
-            return True
-        except Exception as err:
-            _LOGGER.error("Failed initial fetch for %s coordinator: %s", coord_type, err)
-            coord.last_update_success = False
-            return err
-
-    # Load only price coordinators immediately for fast startup
-    price_coordinators = [(c, t, k) for c, t, k in coordinators if t in ("buy", "sell")]
-
-    initial_refresh_tasks = [
-        safe_initial_fetch(coordinator, coordinator_type)
-        for coordinator, coordinator_type, _ in price_coordinators
-    ]
-
-    refresh_results = await asyncio.gather(*initial_refresh_tasks, return_exceptions=True)
-
-    # Check results for price coordinators
-    for i, (coordinator, coordinator_type, key) in enumerate(price_coordinators):
-        if isinstance(refresh_results[i], Exception):
-            _LOGGER.error("Failed to initialize %s coordinator: %s",
-                         coordinator_type, str(refresh_results[i]))
-    
-    # Store all coordinators and set up scheduling
-    buy_coord = None
-    sell_coord = None
-
-    for coordinator, coordinator_type, key in coordinators:
-        # Store coordinator
-        hass.data[DOMAIN][key] = coordinator
-
-        # Schedule updates for price coordinators
-        if coordinator_type in ("buy", "sell"):
-            coordinator.schedule_hourly_update()
-            coordinator.schedule_midnight_update()
-
-            # Schedule afternoon update if 48h mode is enabled
-            if mqtt_48h_mode:
-                coordinator.schedule_afternoon_update()
-
-            # Create ONLY current price sensors (fast, immediate)
-            top = buy_top if coordinator_type == "buy" else sell_top
-            worst = buy_worst if coordinator_type == "buy" else sell_worst
-            entities.append(PstrykPriceSensor(coordinator, coordinator_type, top, worst, entry.entry_id))
-
-            # Store coordinator references for later use
-            if coordinator_type == "buy":
-                buy_coord = coordinator
-            elif coordinator_type == "sell":
-                sell_coord = coordinator
-
-        # Schedule updates for cost coordinator
-        elif coordinator_type == "cost":
-            coordinator.schedule_hourly_update()
-            coordinator.schedule_midnight_update()
-
-    # Create remaining sensors (average price + financial balance) - they will show as unavailable initially
-    remaining_entities = []
-
-    # Create average price sensors for buy
-    if buy_coord:
-        for period in ("daily", "monthly", "yearly"):
-            remaining_entities.append(PstrykAveragePriceSensor(
-                cost_coordinator, buy_coord, period, entry.entry_id
-            ))
-
-    # Create average price sensors for sell
-    if sell_coord:
-        for period in ("daily", "monthly", "yearly"):
-            remaining_entities.append(PstrykAveragePriceSensor(
-                cost_coordinator, sell_coord, period, entry.entry_id
-            ))
-
-    # Create financial balance sensors
-    for period in ("daily", "monthly", "yearly"):
-        remaining_entities.append(PstrykFinancialBalanceSensor(
-            cost_coordinator, period, entry.entry_id
-        ))
-
-    # Register ALL sensors immediately:
-    # - Current price sensors (2) with data
-    # - Remaining sensors (15) as unavailable until cost coordinator loads
-    _LOGGER.info("Registering %d current price sensors with data and %d additional sensors as unavailable",
-                 len(entities), len(remaining_entities))
-    async_add_entities(entities + remaining_entities)
-
-    # Load cost coordinator data in background - sensors will automatically update when data arrives
-    async def lazy_load_cost_data():
-        """Load cost coordinator data in background - sensors update automatically via coordinator."""
-        _LOGGER.info("Waiting 15 seconds before loading cost coordinator data")
-        await asyncio.sleep(15)
-
-        _LOGGER.info("Loading cost coordinator data in background")
-        try:
-            # Load cost coordinator with all resolutions
-            data = await cost_coordinator._async_update_data(fetch_all=True)
-            cost_coordinator.data = data
-            cost_coordinator.last_update_success = True
-            # Notify all listening sensors that data is available
-            cost_coordinator.async_update_listeners()
-            _LOGGER.info("Cost coordinator loaded successfully - %d sensors updated",
-                        len(remaining_entities))
-        except Exception as err:
-            _LOGGER.warning("Failed to load cost coordinator: %s. %d sensors remain unavailable.",
-                          err, len(remaining_entities))
-            cost_coordinator.last_update_success = False
-            cost_coordinator.data = None
-
-    # Start background data loading
-    hass.async_create_task(lazy_load_cost_data())
+    async_add_entities([
+        PstrykPriceSensor(buy_coordinator, "buy", buy_top, buy_worst, entry.entry_id),
+        PstrykPowerSensor(hass, meter_url),
+    ])
 
 
 class PstrykPriceSensor(CoordinatorEntity, SensorEntity):
@@ -816,345 +671,43 @@ class PstrykPriceSensor(CoordinatorEntity, SensorEntity):
         return self.coordinator.last_update_success and self.coordinator.data is not None
 
 
-class PstrykAveragePriceSensor(RestoreEntity, SensorEntity):
-    """Average price sensor using weighted averages from API data."""
+class PstrykPowerSensor(SensorEntity):
+    """Sensor that polls a local energy meter for current power usage."""
+
+    _attr_device_class = SensorDeviceClass.POWER
     _attr_state_class = SensorStateClass.MEASUREMENT
-    
-    def __init__(self, cost_coordinator: PstrykCostDataUpdateCoordinator, 
-                 price_coordinator: PstrykDataUpdateCoordinator,
-                 period: str, entry_id: str):
-        """Initialize the average price sensor."""
-        self.cost_coordinator = cost_coordinator
-        self.price_coordinator = price_coordinator
-        self.price_type = price_coordinator.price_type
-        self.period = period  # 'daily', 'monthly' or 'yearly'
-        self.entry_id = entry_id
-        self._attr_device_class = SensorDeviceClass.MONETARY
-        self._state = None
-        self._energy_bought = 0.0
-        self._energy_sold = 0.0
-        self._total_cost = 0.0
-        self._total_revenue = 0.0
-        
-    async def async_added_to_hass(self):
-        """Restore state when entity is added."""
-        await super().async_added_to_hass()
-        
-        # Subscribe to cost coordinator updates
-        self.async_on_remove(
-            self.cost_coordinator.async_add_listener(self._handle_cost_update)
-        )
-        
-        # Restore previous state
-        last_state = await self.async_get_last_state()
-        if last_state and last_state.state not in (None, "unknown", "unavailable"):
-            try:
-                self._state = float(last_state.state)
-                
-                # Restore attributes
-                if last_state.attributes:
-                    self._energy_bought = float(last_state.attributes.get("energy_bought", 0))
-                    self._energy_sold = float(last_state.attributes.get("energy_sold", 0))
-                    self._total_cost = float(last_state.attributes.get("total_cost", 0))
-                    self._total_revenue = float(last_state.attributes.get("total_revenue", 0))
-                        
-                _LOGGER.debug("Restored weighted average for %s %s: %s", 
-                            self.price_type, self.period, self._state)
-            except (ValueError, TypeError):
-                _LOGGER.warning("Could not restore state for %s", self.name)
-        
-    @property
-    def name(self) -> str:
-        """Return the name of the sensor."""
-        period_name = _TRANSLATIONS_CACHE.get(
-            f"entity.sensor.period_{self.period}",
-            self.period.title()
-        )
-        return f"Pstryk {self.price_type.title()} {period_name} Average"
-        
-    @property
-    def unique_id(self) -> str:
-        """Return unique ID."""
-        return f"{DOMAIN}_{self.price_type}_{self.period}_average"
-        
+    _attr_native_unit_of_measurement = "W"
+    _attr_name = "Pstryk Current Power"
+    _attr_unique_id = f"{DOMAIN}_current_power"
+    SCAN_INTERVAL = timedelta(seconds=30)
+
+    def __init__(self, hass: HomeAssistant, meter_url: str) -> None:
+        self.hass = hass
+        self._meter_url = meter_url
+        self._attr_native_value = None
+
     @property
     def device_info(self):
-        """Return device information."""
         return {
             "identifiers": {(DOMAIN, "pstryk_energy")},
             "name": "Pstryk Energy",
             "manufacturer": "Pstryk",
             "model": "Energy Price Monitor",
-            "sw_version": get_integration_version(self.hass),
         }
-        
-    @property
-    def native_value(self):
-        """Return the state of the sensor."""
-        return self._state
-        
-    @property
-    def native_unit_of_measurement(self) -> str:
-        """Return the unit of measurement."""
-        return "PLN/kWh"
-        
-    @property
-    def extra_state_attributes(self) -> dict:
-        """Return extra state attributes."""
-        period_key = _TRANSLATIONS_CACHE.get(
-            "entity.sensor.period",
-            "Period"
-        )
-        calculation_method_key = _TRANSLATIONS_CACHE.get(
-            "entity.sensor.calculation_method",
-            "Calculation method"
-        )
-        energy_bought_key = _TRANSLATIONS_CACHE.get(
-            "entity.sensor.energy_bought",
-            "Energy bought"
-        )
-        energy_sold_key = _TRANSLATIONS_CACHE.get(
-            "entity.sensor.energy_sold",
-            "Energy sold"
-        )
-        total_cost_key = _TRANSLATIONS_CACHE.get(
-            "entity.sensor.total_cost",
-            "Total cost"
-        )
-        total_revenue_key = _TRANSLATIONS_CACHE.get(
-            "entity.sensor.total_revenue",
-            "Total revenue"
-        )
-        attrs = {
-            period_key: self.period,
-            calculation_method_key: "Weighted average",
-        }
-        
-        # Add energy and cost data if available
-        if self.price_type == "buy" and self._energy_bought > 0:
-            attrs[energy_bought_key] = round(self._energy_bought, 2)
-            attrs[total_cost_key] = round(self._total_cost, 2)
-        elif self.price_type == "sell" and self._energy_sold > 0:
-            attrs[energy_sold_key] = round(self._energy_sold, 2)
-            attrs[total_revenue_key] = round(self._total_revenue, 2)
-            
-        # Add last updated at the bottom
-        last_updated_key = _TRANSLATIONS_CACHE.get(
-            "entity.sensor.last_updated", 
-            "Last updated"
-        )
-        now = dt_util.now()
-        attrs[last_updated_key] = now.strftime("%Y-%m-%d %H:%M:%S")
-        
-        return attrs
-        
-    @callback
-    def _handle_cost_update(self) -> None:
-        """Handle updated data from the cost coordinator."""
-        if not self.cost_coordinator or not self.cost_coordinator.data:
-            return
-            
-        period_data = self.cost_coordinator.data.get(self.period)
-        if not period_data:
-            return
-            
-        # Calculate weighted average based on actual costs and usage
-        if self.price_type == "buy":
-            # For buy price: total cost / total energy bought
-            total_cost = abs(period_data.get("total_cost", 0))  # Already calculated in coordinator
-            energy_bought = period_data.get("fae_usage", 0)  # kWh from usage API
-            
-            if energy_bought > 0:
-                self._state = round(total_cost / energy_bought, 4)
-                self._energy_bought = energy_bought
-                self._total_cost = total_cost
-            else:
-                self._state = None
-                
-        elif self.price_type == "sell":
-            # For sell price: total revenue / total energy sold
-            total_revenue = period_data.get("total_sold", 0)
-            energy_sold = period_data.get("rae_usage", 0)  # kWh from usage API
-            
-            if energy_sold > 0:
-                self._state = round(total_revenue / energy_sold, 4)
-                self._energy_sold = energy_sold
-                self._total_revenue = total_revenue
-            else:
-                self._state = None
-                
-        self.async_write_ha_state()
-        
-    @property
-    def available(self) -> bool:
-        """Return if entity is available."""
-        return (self.cost_coordinator is not None and 
-                self.cost_coordinator.last_update_success and
-                self.cost_coordinator.data is not None)
 
+    async def async_update(self) -> None:
+        """Fetch current power from local meter."""
+        try:
+            session = async_get_clientsession(self.hass)
+            async with session.get(self._meter_url, timeout=10) as resp:
+                data = await resp.json()
+            sensors = data["multiSensor"]["sensors"]
+            for s in sensors:
+                if s.get("type") == "activePower" and s.get("id") == 0:
+                    self._attr_native_value = s["value"]
+                    return
+            _LOGGER.warning("activePower sensor not found in meter response")
+        except Exception as err:
+            _LOGGER.error("Failed to fetch power from local meter: %s", err)
+            self._attr_native_value = None
 
-class PstrykFinancialBalanceSensor(CoordinatorEntity, SensorEntity):
-    """Financial balance sensor that gets data directly from API."""
-    _attr_state_class = SensorStateClass.TOTAL
-    _attr_device_class = SensorDeviceClass.MONETARY
-    
-    def __init__(self, coordinator: PstrykCostDataUpdateCoordinator, 
-                 period: str, entry_id: str):
-        """Initialize the financial balance sensor."""
-        super().__init__(coordinator)
-        self.period = period  # 'daily', 'monthly', or 'yearly'
-        self.entry_id = entry_id
-        
-    @property
-    def name(self) -> str:
-        """Return the name of the sensor."""
-        period_name = _TRANSLATIONS_CACHE.get(
-            f"entity.sensor.period_{self.period}",
-            self.period.title()
-        )
-        balance_text = _TRANSLATIONS_CACHE.get(
-            "entity.sensor.financial_balance",
-            "Financial Balance"
-        )
-        return f"Pstryk {period_name} {balance_text}"
-        
-    @property
-    def unique_id(self) -> str:
-        """Return unique ID."""
-        return f"{DOMAIN}_financial_balance_{self.period}"
-        
-    @property
-    def device_info(self):
-        """Return device information."""
-        return {
-            "identifiers": {(DOMAIN, "pstryk_energy")},
-            "name": "Pstryk Energy",
-            "manufacturer": "Pstryk",
-            "model": "Energy Price Monitor",
-            "sw_version": get_integration_version(self.hass),
-        }
-        
-    @property
-    def native_value(self):
-        """Return the state of the sensor from API data."""
-        if not self.coordinator.data:
-            return None
-            
-        period_data = self.coordinator.data.get(self.period)
-        if not period_data or "total_balance" not in period_data:
-            return None
-            
-        # Get the balance value from API
-        balance = period_data.get("total_balance")
-        
-        # Return exact value from API without rounding
-        return balance
-        
-    @property
-    def native_unit_of_measurement(self) -> str:
-        """Return the unit of measurement."""
-        return "PLN"
-        
-    @property
-    def icon(self) -> str:
-        """Return the icon based on balance."""
-        if self.native_value is None:
-            return "mdi:currency-usd-off"
-        elif self.native_value < 0:
-            return "mdi:cash-minus"  # We're paying
-        elif self.native_value > 0:
-            return "mdi:cash-plus"   # We're earning
-        else:
-            return "mdi:cash"
-            
-    @property
-    def extra_state_attributes(self) -> dict:
-        """Return extra state attributes from API data."""
-        if not self.coordinator.data or not self.coordinator.data.get(self.period):
-            return {}
-            
-        period_data = self.coordinator.data.get(self.period)
-        frame = period_data.get("frame", {})
-        
-        # Get translated attribute names
-        buy_cost_key = _TRANSLATIONS_CACHE.get(
-            "entity.sensor.buy_cost",
-            "Buy cost"
-        )
-        sell_revenue_key = _TRANSLATIONS_CACHE.get(
-            "entity.sensor.sell_revenue",
-            "Sell revenue"
-        )
-        period_key = _TRANSLATIONS_CACHE.get(
-            "entity.sensor.period",
-            "Period"
-        )
-        net_balance_key = _TRANSLATIONS_CACHE.get(
-            "entity.sensor.balance",
-            "Balance"
-        )
-        distribution_cost_key = _TRANSLATIONS_CACHE.get(
-            "entity.sensor.distribution_cost",
-            "Distribution cost"
-        )
-        excise_key = _TRANSLATIONS_CACHE.get(
-            "entity.sensor.excise",
-            "Excise"
-        )
-        vat_key = _TRANSLATIONS_CACHE.get(
-            "entity.sensor.vat",
-            "VAT"
-        )
-        service_cost_key = _TRANSLATIONS_CACHE.get(
-            "entity.sensor.service_cost",
-            "Service cost"
-        )
-        energy_bought_key = _TRANSLATIONS_CACHE.get(
-            "entity.sensor.energy_bought",
-            "Energy bought"
-        )
-        energy_sold_key = _TRANSLATIONS_CACHE.get(
-            "entity.sensor.energy_sold", 
-            "Energy sold"
-        )
-        attrs = {
-            period_key: self.period,
-            net_balance_key: period_data.get("total_balance", 0),
-            buy_cost_key: period_data.get("total_cost", 0),
-            sell_revenue_key: period_data.get("total_sold", 0),
-            energy_bought_key: period_data.get("fae_usage", 0),
-            energy_sold_key: period_data.get("rae_usage", 0),
-        }
-        
-        # Add detailed cost breakdown if available
-        if frame:
-            # Konwertuj daty UTC na lokalne
-            start_utc = frame.get("start")
-            end_utc = frame.get("end")
-            
-            start_local = dt_util.as_local(dt_util.parse_datetime(start_utc)) if start_utc else None
-            end_local = dt_util.as_local(dt_util.parse_datetime(end_utc)) if end_utc else None
-
-            attrs.update({
-                distribution_cost_key: frame.get("var_dist_cost_net", 0) + frame.get("fix_dist_cost_net", 0),
-                excise_key: frame.get("excise", 0),
-                vat_key: frame.get("vat", 0),
-                service_cost_key: frame.get("service_cost_net", 0),
-                "start": start_local.strftime("%Y-%m-%d") if start_local else None,
-                "end": end_local.strftime("%Y-%m-%d") if end_local else None,
-            })
-            
-        # Add last updated at the bottom
-        last_updated_key = _TRANSLATIONS_CACHE.get(
-            "entity.sensor.last_updated", 
-            "Last updated"
-        )
-        now = dt_util.now()
-        attrs[last_updated_key] = now.strftime("%Y-%m-%d %H:%M:%S")
-        
-        return attrs
-        
-    @property
-    def available(self) -> bool:
-        """Return if entity is available."""
-        return self.coordinator.last_update_success and self.coordinator.data is not None
