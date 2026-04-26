@@ -6,8 +6,10 @@ from homeassistant.core import HomeAssistant, callback
 from homeassistant.components.sensor import SensorEntity, SensorStateClass, SensorDeviceClass
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
+from homeassistant.helpers.event import async_track_state_change_event
 from homeassistant.util import dt as dt_util
 from .update_coordinator import PstrykDataUpdateCoordinator
+from .energy_cost_coordinator import PstrykCostDataUpdateCoordinator
 from .api_client import PstrykAPIClient
 from .const import (
     DOMAIN,
@@ -110,9 +112,29 @@ async def async_setup_entry(
     if mqtt_48h_mode:
         buy_coordinator.schedule_afternoon_update()
 
+    # Create cost coordinator (monthly/daily data for billing sensors)
+    cost_key = f"{entry.entry_id}_cost"
+    cost_coordinator = PstrykCostDataUpdateCoordinator(
+        hass, api_client, retry_attempts, retry_delay
+    )
+    try:
+        data = await cost_coordinator._async_update_data()
+        cost_coordinator.data = data
+        cost_coordinator.last_update_success = True
+    except Exception as err:
+        _LOGGER.error("Failed initial fetch for cost coordinator: %s", err)
+        cost_coordinator.last_update_success = False
+
+    hass.data[DOMAIN][cost_key] = cost_coordinator
+    cost_coordinator.schedule_hourly_update()
+    cost_coordinator.schedule_midnight_update()
+
     async_add_entities([
         PstrykPriceSensor(buy_coordinator, "buy", buy_top, buy_worst, entry.entry_id),
         PstrykPowerSensor(hass, meter_url),
+        PstrykCurrentCostSensor(buy_coordinator),
+        PstrykMonthlyConsumptionSensor(cost_coordinator),
+        PstrykMonthlyBillSensor(cost_coordinator),
     ])
 
 
@@ -710,4 +732,134 @@ class PstrykPowerSensor(SensorEntity):
         except Exception as err:
             _LOGGER.error("Failed to fetch power from local meter: %s", err)
             self._attr_native_value = None
+
+
+class PstrykCurrentCostSensor(CoordinatorEntity, SensorEntity):
+    """Sensor showing current spend rate: power × price (PLN/h)."""
+
+    _attr_name = "Pstryk Current Cost Rate"
+    _attr_unique_id = f"{DOMAIN}_current_cost_rate"
+    _attr_native_unit_of_measurement = "PLN/h"
+    _attr_device_class = SensorDeviceClass.MONETARY
+    _attr_state_class = SensorStateClass.MEASUREMENT
+
+    def __init__(self, coordinator: PstrykDataUpdateCoordinator) -> None:
+        super().__init__(coordinator)
+
+    @property
+    def device_info(self):
+        return {
+            "identifiers": {(DOMAIN, "pstryk_energy")},
+            "name": "Pstryk Energy",
+            "manufacturer": "Pstryk",
+            "model": "Energy Price Monitor",
+        }
+
+    async def async_added_to_hass(self) -> None:
+        await super().async_added_to_hass()
+        self.async_on_remove(
+            async_track_state_change_event(
+                self.hass,
+                ["sensor.pstryk_current_power"],
+                self._handle_power_change,
+            )
+        )
+
+    @callback
+    def _handle_power_change(self, event) -> None:
+        self.async_write_ha_state()
+
+    def _get_current_price(self):
+        if not self.coordinator.data or not self.coordinator.data.get("prices"):
+            return None
+        now_utc = dt_util.utcnow()
+        for price_entry in self.coordinator.data.get("prices", []):
+            if "start" not in price_entry:
+                continue
+            try:
+                price_datetime = dt_util.parse_datetime(price_entry["start"])
+                if not price_datetime:
+                    continue
+                price_datetime_utc = dt_util.as_utc(price_datetime)
+                if price_datetime_utc <= now_utc < price_datetime_utc + timedelta(hours=1):
+                    return price_entry.get("price")
+            except Exception:
+                pass
+        return None
+
+    @property
+    def native_value(self):
+        price = self._get_current_price()
+        if price is None:
+            return None
+        power_state = self.hass.states.get("sensor.pstryk_current_power")
+        if power_state is None or power_state.state in ("unknown", "unavailable"):
+            return None
+        try:
+            power_w = float(power_state.state)
+        except ValueError:
+            return None
+        return round((power_w / 1000) * price, 4)
+
+
+class PstrykMonthlyConsumptionSensor(CoordinatorEntity, SensorEntity):
+    """Sensor showing this month's total energy consumption in kWh."""
+
+    _attr_name = "Pstryk Monthly Consumption"
+    _attr_unique_id = f"{DOMAIN}_monthly_consumption"
+    _attr_native_unit_of_measurement = "kWh"
+    _attr_device_class = SensorDeviceClass.ENERGY
+    _attr_state_class = SensorStateClass.TOTAL
+
+    def __init__(self, coordinator: PstrykCostDataUpdateCoordinator) -> None:
+        super().__init__(coordinator)
+
+    @property
+    def device_info(self):
+        return {
+            "identifiers": {(DOMAIN, "pstryk_energy")},
+            "name": "Pstryk Energy",
+            "manufacturer": "Pstryk",
+            "model": "Energy Price Monitor",
+        }
+
+    @property
+    def native_value(self):
+        if not self.coordinator.data:
+            return None
+        monthly = self.coordinator.data.get("monthly")
+        if not monthly:
+            return None
+        return monthly.get("fae_usage")
+
+
+class PstrykMonthlyBillSensor(CoordinatorEntity, SensorEntity):
+    """Sensor showing this month's total electricity bill in PLN."""
+
+    _attr_name = "Pstryk Monthly Bill"
+    _attr_unique_id = f"{DOMAIN}_monthly_bill"
+    _attr_native_unit_of_measurement = "PLN"
+    _attr_device_class = SensorDeviceClass.MONETARY
+    _attr_state_class = SensorStateClass.TOTAL
+
+    def __init__(self, coordinator: PstrykCostDataUpdateCoordinator) -> None:
+        super().__init__(coordinator)
+
+    @property
+    def device_info(self):
+        return {
+            "identifiers": {(DOMAIN, "pstryk_energy")},
+            "name": "Pstryk Energy",
+            "manufacturer": "Pstryk",
+            "model": "Energy Price Monitor",
+        }
+
+    @property
+    def native_value(self):
+        if not self.coordinator.data:
+            return None
+        monthly = self.coordinator.data.get("monthly")
+        if not monthly:
+            return None
+        return monthly.get("total_cost")
 
