@@ -163,14 +163,6 @@ async def _cleanup_coordinators(hass: HomeAssistant, entry: ConfigEntry) -> None
             cost_coordinator._unsub_midnight()
             cost_coordinator._unsub_midnight = None
         hass.data[DOMAIN].pop(cost_key, None)
-
-    # Clean up prognosis coordinator
-    prognosis_key = f"{entry.entry_id}_prognosis"
-    prognosis_coordinator = hass.data[DOMAIN].get(prognosis_key)
-    if prognosis_coordinator:
-        _LOGGER.debug("Cleaning up prognosis coordinator for entry %s", entry.entry_id)
-        prognosis_coordinator.cancel()
-        hass.data[DOMAIN].pop(prognosis_key, None)
     
     # Clean up mqtt 48h mode flag
     hass.data[DOMAIN].pop(f"{entry.entry_id}_mqtt_48h_mode", None)
