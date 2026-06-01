@@ -41,16 +41,12 @@ class PstrykPrognosisCoordinator(DataUpdateCoordinator):
             raise UpdateFailed(f"Error fetching prognosis data: {err}") from err
 
         frames = data.get("frames", [])
-        _LOGGER.warning("Prognosis: received %d frames from API", len(frames))
-
         prices = []
         for frame in frames:
-            # Mirror existing coordinator: check frame directly first, then metrics.pricing
             pricing = frame.get("metrics", {}).get("pricing", {})
-            tge_price = frame.get("tge_price", pricing.get("tge_price"))
-            if tge_price is None:
+            if pricing.get("tge_price") is None:
                 continue
-            raw_gross = frame.get("price_gross", pricing.get("price_gross"))
+            raw_gross = pricing.get("price_gross")
             if raw_gross is None:
                 continue
             try:
@@ -62,7 +58,7 @@ class PstrykPrognosisCoordinator(DataUpdateCoordinator):
                 continue
             prices.append({"start": start, "price_gross": price_gross})
 
-        _LOGGER.warning("Prognosis: %d frames passed tge_price filter", len(prices))
+        _LOGGER.debug("Prognosis: %d/%d frames have valid tge_price", len(prices), len(frames))
 
         if prices:
             self._inject_statistics(prices)
