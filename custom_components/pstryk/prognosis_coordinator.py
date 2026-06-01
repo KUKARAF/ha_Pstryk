@@ -1,4 +1,4 @@
-"""Data update coordinator for Pstryk price prognosis (future buy prices)."""
+"""Data update coordinator for Pstryk price prognosis (peak/dip sensors)."""
 import logging
 from datetime import timedelta
 
@@ -11,11 +11,9 @@ from .api_client import PstrykAPIClient
 
 _LOGGER = logging.getLogger(__name__)
 
-STATISTIC_ID = "pstryk:future_buy_price"
-
 
 class PstrykPrognosisCoordinator(DataUpdateCoordinator):
-    """Fetches day-ahead TGE prices and injects them as HA external statistics."""
+    """Fetches tomorrow's TGE prices and computes peak/dip hours."""
 
     def __init__(self, hass, api_client: PstrykAPIClient):
         self.api_client = api_client
@@ -23,7 +21,7 @@ class PstrykPrognosisCoordinator(DataUpdateCoordinator):
         super().__init__(hass, _LOGGER, name="pstryk_prognosis")
 
     async def _async_update_data(self):
-        """Fetch pricing frames filtered to tge_price != None and inject as statistics."""
+        """Fetch tomorrow's prices and return peak morning, peak evening, and dip hour."""
         today_local = dt_util.now().replace(hour=0, minute=0, second=0, microsecond=0)
         window_end_local = today_local + timedelta(days=2)
         start_utc = dt_util.as_utc(today_local)
@@ -33,68 +31,54 @@ class PstrykPrognosisCoordinator(DataUpdateCoordinator):
             f"{API_URL}"
             f"{PRICING_ENDPOINT.format(start=start_utc.strftime('%Y-%m-%dT%H:%M:%SZ'), end=end_utc.strftime('%Y-%m-%dT%H:%M:%SZ'))}"
         )
-        _LOGGER.debug("Fetching prognosis data from %s", url)
 
         try:
             data = await self.api_client.fetch(url)
         except Exception as err:
             raise UpdateFailed(f"Error fetching prognosis data: {err}") from err
 
-        frames = data.get("frames", [])
+        tomorrow = (dt_util.now() + timedelta(days=1)).strftime("%Y-%m-%d")
+
         prices = []
-        for frame in frames:
+        for frame in data.get("frames", []):
             pricing = frame.get("metrics", {}).get("pricing", {})
             if pricing.get("tge_price") is None:
                 continue
             raw_gross = pricing.get("price_gross")
             if raw_gross is None:
                 continue
-            try:
-                price_gross = round(float(str(raw_gross).replace(",", ".")), 4)
-            except (ValueError, TypeError):
+            start_dt = dt_util.parse_datetime(frame.get("start", ""))
+            if start_dt is None:
                 continue
-            start = frame.get("start", "")
-            if not start:
+            local_start = dt_util.as_local(start_dt)
+            if local_start.strftime("%Y-%m-%d") != tomorrow:
                 continue
-            prices.append({"start": start, "price_gross": price_gross})
+            prices.append({"start": local_start, "price_gross": float(raw_gross)})
 
-        _LOGGER.debug("Prognosis: %d/%d frames have valid tge_price", len(prices), len(frames))
+        _LOGGER.debug("Prognosis: %d tomorrow frames with valid tge_price", len(prices))
 
-        if prices:
-            self._inject_statistics(prices)
+        def find_peak(start_h, end_h):
+            candidates = [p for p in prices if start_h <= p["start"].hour < end_h]
+            return max(candidates, key=lambda p: p["price_gross"]) if candidates else None
 
-        return {"prices": prices, "fetched_at": dt_util.now().isoformat()}
+        def find_dip():
+            return min(prices, key=lambda p: p["price_gross"]) if prices else None
 
-    def _inject_statistics(self, prices):
-        """Push hourly price data into HA recorder as external statistics."""
-        from homeassistant.components.recorder.models import StatisticData, StatisticMetaData
-        from homeassistant.components.recorder.statistics import async_add_external_statistics
+        def fmt(entry):
+            if entry is None:
+                return None
+            return {
+                "start": entry["start"].strftime("%Y-%m-%dT%H:%M:%S"),
+                "price_gross": round(entry["price_gross"], 4),
+            }
 
-        try:
-            from homeassistant.components.recorder.models import StatisticMeanType
-            mean_type_kwargs = {"mean_type": StatisticMeanType.ARITHMETIC}
-        except ImportError:
-            mean_type_kwargs = {}
-
-        metadata = StatisticMetaData(
-            has_mean=True,
-            has_sum=False,
-            name="Pstryk Future Buy Price",
-            source="pstryk",
-            statistic_id=STATISTIC_ID,
-            unit_of_measurement="PLN/kWh",
-            unit_class=None,
-            **mean_type_kwargs,
-        )
-        stats = []
-        for p in prices:
-            dt = dt_util.parse_datetime(p["start"])
-            if dt is None:
-                continue
-            stats.append(StatisticData(start=dt_util.as_utc(dt), mean=p["price_gross"]))
-
-        async_add_external_statistics(self.hass, metadata, stats)
-        _LOGGER.debug("Injected %d statistic entries for %s", len(stats), STATISTIC_ID)
+        return {
+            "peak_morning": fmt(find_peak(6, 13)),
+            "peak_evening": fmt(find_peak(16, 22)),
+            "dip": fmt(find_dip()),
+            "date": tomorrow,
+            "fetched_at": dt_util.now().isoformat(),
+        }
 
     def _next_poll_time(self, now):
         """Return the next scheduled poll time (every 30 min between 15:00 and 23:00)."""
@@ -114,16 +98,13 @@ class PstrykPrognosisCoordinator(DataUpdateCoordinator):
             self._unsub = None
 
         next_time = self._next_poll_time(dt_util.now())
-        _LOGGER.debug(
-            "Next prognosis poll at %s", next_time.strftime("%Y-%m-%d %H:%M:%S")
-        )
+        _LOGGER.debug("Next prognosis poll at %s", next_time.strftime("%Y-%m-%d %H:%M:%S"))
         self._unsub = async_track_point_in_time(
             self.hass, self._handle_update, dt_util.as_utc(next_time)
         )
 
     async def _handle_update(self, _):
         """Run a fresh fetch then re-schedule."""
-        _LOGGER.debug("Prognosis scheduled poll triggered")
         try:
             await self.async_request_refresh()
         except Exception as err:

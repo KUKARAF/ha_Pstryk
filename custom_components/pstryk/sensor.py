@@ -148,7 +148,9 @@ async def async_setup_entry(
         PstrykCurrentCostSensor(buy_coordinator),
         PstrykMonthlyConsumptionSensor(cost_coordinator),
         PstrykMonthlyBillSensor(cost_coordinator),
-        PstrykFutureBuyPriceSensor(prognosis_coordinator),
+        PstrykPeakMorningSensor(prognosis_coordinator),
+        PstrykPeakEveningSensor(prognosis_coordinator),
+        PstrykDipSensor(prognosis_coordinator),
     ])
 
 
@@ -878,14 +880,13 @@ class PstrykMonthlyBillSensor(CoordinatorEntity, SensorEntity):
         return monthly.get("total_cost")
 
 
-class PstrykFutureBuyPriceSensor(CoordinatorEntity, SensorEntity):
-    """Sensor showing the current hour's forecasted gross buy price (TGE-based)."""
+class _PstrykPrognosisSensor(CoordinatorEntity, SensorEntity):
+    """Base class for prognosis sensors (peak morning, peak evening, dip)."""
 
-    _attr_name = "Pstryk Future Buy Price"
-    _attr_unique_id = f"{DOMAIN}_future_buy_price"
     _attr_native_unit_of_measurement = "PLN/kWh"
     _attr_device_class = SensorDeviceClass.MONETARY
     _attr_state_class = None
+    _KEY: str = ""
 
     def __init__(self, coordinator: PstrykPrognosisCoordinator) -> None:
         super().__init__(coordinator)
@@ -901,20 +902,53 @@ class PstrykFutureBuyPriceSensor(CoordinatorEntity, SensorEntity):
 
     @property
     def native_value(self):
-        if not self.coordinator.data:
-            return None
-        prices = self.coordinator.data.get("prices", [])
-        now_utc = dt_util.utcnow()
-        for entry in prices:
-            dt = dt_util.parse_datetime(entry["start"])
-            if dt is None:
-                continue
-            start_utc = dt_util.as_utc(dt)
-            if start_utc <= now_utc < start_utc + timedelta(hours=1):
-                return entry.get("price_gross")
-        return None
+        entry = self._entry()
+        return entry["price_gross"] if entry else None
+
+    @property
+    def extra_state_attributes(self):
+        entry = self._entry()
+        if not entry:
+            return {}
+        return {
+            "hour": entry["start"],
+            "date": self.coordinator.data.get("date"),
+        }
 
     @property
     def available(self) -> bool:
-        return self.coordinator.last_update_success and self.coordinator.data is not None
+        return (
+            self.coordinator.last_update_success
+            and self.coordinator.data is not None
+            and self.coordinator.data.get(self._KEY) is not None
+        )
+
+    def _entry(self):
+        if not self.coordinator.data:
+            return None
+        return self.coordinator.data.get(self._KEY)
+
+
+class PstrykPeakMorningSensor(_PstrykPrognosisSensor):
+    """Most expensive hour tomorrow between 06:00 and 13:00."""
+
+    _attr_name = "Pstryk Peak Morning"
+    _attr_unique_id = f"{DOMAIN}_peak_morning"
+    _KEY = "peak_morning"
+
+
+class PstrykPeakEveningSensor(_PstrykPrognosisSensor):
+    """Most expensive hour tomorrow between 16:00 and 22:00."""
+
+    _attr_name = "Pstryk Peak Evening"
+    _attr_unique_id = f"{DOMAIN}_peak_evening"
+    _KEY = "peak_evening"
+
+
+class PstrykDipSensor(_PstrykPrognosisSensor):
+    """Cheapest hour tomorrow across the full day."""
+
+    _attr_name = "Pstryk Dip Hour"
+    _attr_unique_id = f"{DOMAIN}_dip_hour"
+    _KEY = "dip"
 
