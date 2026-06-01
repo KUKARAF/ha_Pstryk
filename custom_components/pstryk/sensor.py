@@ -10,6 +10,7 @@ from homeassistant.helpers.event import async_track_state_change_event
 from homeassistant.util import dt as dt_util
 from .update_coordinator import PstrykDataUpdateCoordinator
 from .energy_cost_coordinator import PstrykCostDataUpdateCoordinator
+from .prognosis_coordinator import PstrykPrognosisCoordinator
 from .api_client import PstrykAPIClient
 from .const import (
     DOMAIN,
@@ -129,12 +130,25 @@ async def async_setup_entry(
     cost_coordinator.schedule_hourly_update()
     cost_coordinator.schedule_midnight_update()
 
+    prognosis_coordinator = PstrykPrognosisCoordinator(hass, api_client)
+    try:
+        data = await prognosis_coordinator._async_update_data()
+        prognosis_coordinator.data = data
+        prognosis_coordinator.last_update_success = True
+    except Exception as err:
+        _LOGGER.error("Failed initial fetch for prognosis coordinator: %s", err)
+        prognosis_coordinator.last_update_success = False
+
+    hass.data[DOMAIN][f"{entry.entry_id}_prognosis"] = prognosis_coordinator
+    prognosis_coordinator.schedule_next_update()
+
     async_add_entities([
         PstrykPriceSensor(buy_coordinator, "buy", buy_top, buy_worst, entry.entry_id),
         PstrykPowerSensor(hass, meter_url),
         PstrykCurrentCostSensor(buy_coordinator),
         PstrykMonthlyConsumptionSensor(cost_coordinator),
         PstrykMonthlyBillSensor(cost_coordinator),
+        PstrykFutureBuyPriceSensor(prognosis_coordinator),
     ])
 
 
@@ -862,4 +876,45 @@ class PstrykMonthlyBillSensor(CoordinatorEntity, SensorEntity):
         if not monthly:
             return None
         return monthly.get("total_cost")
+
+
+class PstrykFutureBuyPriceSensor(CoordinatorEntity, SensorEntity):
+    """Sensor showing the current hour's forecasted gross buy price (TGE-based)."""
+
+    _attr_name = "Pstryk Future Buy Price"
+    _attr_unique_id = f"{DOMAIN}_future_buy_price"
+    _attr_native_unit_of_measurement = "PLN/kWh"
+    _attr_device_class = SensorDeviceClass.MONETARY
+    _attr_state_class = SensorStateClass.MEASUREMENT
+
+    def __init__(self, coordinator: PstrykPrognosisCoordinator) -> None:
+        super().__init__(coordinator)
+
+    @property
+    def device_info(self):
+        return {
+            "identifiers": {(DOMAIN, "pstryk_energy")},
+            "name": "Pstryk Energy",
+            "manufacturer": "Pstryk",
+            "model": "Energy Price Monitor",
+        }
+
+    @property
+    def native_value(self):
+        if not self.coordinator.data:
+            return None
+        prices = self.coordinator.data.get("prices", [])
+        now_utc = dt_util.utcnow()
+        for entry in prices:
+            dt = dt_util.parse_datetime(entry["start"])
+            if dt is None:
+                continue
+            start_utc = dt_util.as_utc(dt)
+            if start_utc <= now_utc < start_utc + timedelta(hours=1):
+                return entry.get("price_gross")
+        return None
+
+    @property
+    def available(self) -> bool:
+        return self.coordinator.last_update_success and self.coordinator.data is not None
 

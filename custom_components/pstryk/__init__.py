@@ -167,6 +167,12 @@ async def _cleanup_coordinators(hass: HomeAssistant, entry: ConfigEntry) -> None
     # Clean up mqtt 48h mode flag
     hass.data[DOMAIN].pop(f"{entry.entry_id}_mqtt_48h_mode", None)
 
+    # Clean up prognosis coordinator
+    prognosis = hass.data[DOMAIN].get(f"{entry.entry_id}_prognosis")
+    if prognosis:
+        prognosis.cancel()
+        hass.data[DOMAIN].pop(f"{entry.entry_id}_prognosis", None)
+
     # Clean up API client
     api_client_key = f"{entry.entry_id}_api_client"
     if api_client_key in hass.data[DOMAIN]:
