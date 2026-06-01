@@ -149,7 +149,8 @@ async def async_setup_entry(
         PstrykCurrentCostSensor(buy_coordinator),
         PstrykMonthlyConsumptionSensor(cost_coordinator),
         PstrykMonthlyBillSensor(cost_coordinator),
-        PstrykPricePrognosis(prognosis_coordinator),
+        PstrykPrognosisSensor(prognosis_coordinator, "tge_price"),
+        PstrykPrognosisSensor(prognosis_coordinator, "price_gross"),
     ])
 
 
@@ -879,24 +880,19 @@ class PstrykMonthlyBillSensor(CoordinatorEntity, SensorEntity):
         return monthly.get("total_cost")
 
 
-class PstrykPricePrognosis(CoordinatorEntity, SensorEntity):
-    """Sensor exposing the full hourly price prognosis as an attribute object.
+class PstrykPrognosisSensor(CoordinatorEntity, SensorEntity):
+    """Current-hour value for one prognosis field, with the full forecast in attributes."""
 
-    State: number of future price hours available.
-    Attribute 'prices': list of {start, end, tge_price, price_net, price_gross,
-                                  is_cheap, is_expensive} for every hour with a
-                                  known TGE price, ordered chronologically.
-    Updated every 30 minutes between 15:00 and 23:00 local time.
-    """
-
-    _attr_name = "Pstryk Price Prognosis"
-    _attr_unique_id = f"{DOMAIN}_price_prognosis"
-    _attr_native_unit_of_measurement = "h"
+    _attr_native_unit_of_measurement = "PLN/kWh"
+    _attr_device_class = SensorDeviceClass.MONETARY
     _attr_state_class = SensorStateClass.MEASUREMENT
     _attr_icon = "mdi:chart-line"
 
-    def __init__(self, coordinator: PstrykPrognosisCoordinator) -> None:
+    def __init__(self, coordinator: PstrykPrognosisCoordinator, field: str) -> None:
         super().__init__(coordinator)
+        self._field = field
+        self._attr_name = f"Pstryk Prognosis {field.replace('_', ' ').title()}"
+        self._attr_unique_id = f"{DOMAIN}_prognosis_{field}"
 
     @property
     def device_info(self):
@@ -907,33 +903,30 @@ class PstrykPricePrognosis(CoordinatorEntity, SensorEntity):
             "model": "Energy Price Monitor",
         }
 
-    @property
-    def native_value(self):
-        """Return the number of future hours in the prognosis."""
-        prices = self._future_prices()
-        return len(prices) if prices is not None else None
-
-    @property
-    def extra_state_attributes(self):
-        prices = self._future_prices()
-        if prices is None:
-            return {}
-        fetched_at = self.coordinator.data.get("fetched_at") if self.coordinator.data else None
-        return {
-            "prices": prices,
-            "fetched_at": fetched_at,
-        }
-
-    def _future_prices(self):
+    def _current_entry(self):
         if not self.coordinator.data:
             return None
         now_utc = dt_util.utcnow()
-        result = []
         for entry in self.coordinator.data.get("prices", []):
             start = dt_util.parse_datetime(entry["start"])
-            if start and dt_util.as_utc(start) >= now_utc:
-                result.append(entry)
-        return result
+            if not start:
+                continue
+            if dt_util.as_utc(start) <= now_utc < dt_util.as_utc(start) + timedelta(hours=1):
+                return entry
+        return None
+
+    @property
+    def native_value(self):
+        entry = self._current_entry()
+        return entry.get(self._field) if entry else None
+
+    @property
+    def extra_state_attributes(self):
+        entry = self._current_entry()
+        return {
+            "start": entry["start"] if entry else None,
+            "prices": self.coordinator.data.get("prices", []) if self.coordinator.data else [],
+        }
 
     @property
     def available(self) -> bool:
