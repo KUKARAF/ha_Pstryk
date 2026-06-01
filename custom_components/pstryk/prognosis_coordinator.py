@@ -40,12 +40,17 @@ class PstrykPrognosisCoordinator(DataUpdateCoordinator):
         except Exception as err:
             raise UpdateFailed(f"Error fetching prognosis data: {err}") from err
 
+        frames = data.get("frames", [])
+        _LOGGER.info("Prognosis: received %d frames from API", len(frames))
+
         prices = []
-        for frame in data.get("frames", []):
+        for frame in frames:
+            # Mirror existing coordinator: check frame directly first, then metrics.pricing
             pricing = frame.get("metrics", {}).get("pricing", {})
-            if pricing.get("tge_price") is None:
+            tge_price = frame.get("tge_price", pricing.get("tge_price"))
+            if tge_price is None:
                 continue
-            raw_gross = pricing.get("price_gross")
+            raw_gross = frame.get("price_gross", pricing.get("price_gross"))
             if raw_gross is None:
                 continue
             try:
@@ -57,7 +62,7 @@ class PstrykPrognosisCoordinator(DataUpdateCoordinator):
                 continue
             prices.append({"start": start, "price_gross": price_gross})
 
-        _LOGGER.debug("Prognosis: %d frames with valid tge_price", len(prices))
+        _LOGGER.info("Prognosis: %d frames passed tge_price filter", len(prices))
 
         if prices:
             self._inject_statistics(prices)
@@ -69,6 +74,12 @@ class PstrykPrognosisCoordinator(DataUpdateCoordinator):
         from homeassistant.components.recorder.models import StatisticData, StatisticMetaData
         from homeassistant.components.recorder.statistics import async_add_external_statistics
 
+        try:
+            from homeassistant.components.recorder.models import StatisticMeanType
+            mean_type_kwargs = {"mean_type": StatisticMeanType.ARITHMETIC}
+        except ImportError:
+            mean_type_kwargs = {}
+
         metadata = StatisticMetaData(
             has_mean=True,
             has_sum=False,
@@ -76,6 +87,7 @@ class PstrykPrognosisCoordinator(DataUpdateCoordinator):
             source="pstryk",
             statistic_id=STATISTIC_ID,
             unit_of_measurement="PLN/kWh",
+            **mean_type_kwargs,
         )
         stats = []
         for p in prices:

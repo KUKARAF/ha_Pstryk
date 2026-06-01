@@ -885,7 +885,7 @@ class PstrykFutureBuyPriceSensor(CoordinatorEntity, SensorEntity):
     _attr_unique_id = f"{DOMAIN}_future_buy_price"
     _attr_native_unit_of_measurement = "PLN/kWh"
     _attr_device_class = SensorDeviceClass.MONETARY
-    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_state_class = None
 
     def __init__(self, coordinator: PstrykPrognosisCoordinator) -> None:
         super().__init__(coordinator)
