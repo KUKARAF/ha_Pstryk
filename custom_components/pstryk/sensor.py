@@ -10,6 +10,7 @@ from homeassistant.helpers.event import async_track_state_change_event
 from homeassistant.util import dt as dt_util
 from .update_coordinator import PstrykDataUpdateCoordinator
 from .energy_cost_coordinator import PstrykCostDataUpdateCoordinator
+from .prognosis_coordinator import PstrykPrognosisCoordinator
 from .api_client import PstrykAPIClient
 from .const import (
     DOMAIN,
@@ -129,12 +130,26 @@ async def async_setup_entry(
     cost_coordinator.schedule_hourly_update()
     cost_coordinator.schedule_midnight_update()
 
+    # Create prognosis coordinator (polls every 30 min from 15:00)
+    prognosis_key = f"{entry.entry_id}_prognosis"
+    prognosis_coordinator = PstrykPrognosisCoordinator(hass, api_client)
+    try:
+        data = await prognosis_coordinator._async_update_data()
+        prognosis_coordinator.data = data
+        prognosis_coordinator.last_update_success = True
+    except Exception as err:
+        _LOGGER.error("Failed initial fetch for prognosis coordinator: %s", err)
+        prognosis_coordinator.last_update_success = False
+    hass.data[DOMAIN][prognosis_key] = prognosis_coordinator
+    prognosis_coordinator.schedule_next_update()
+
     async_add_entities([
         PstrykPriceSensor(buy_coordinator, "buy", buy_top, buy_worst, entry.entry_id),
         PstrykPowerSensor(hass, meter_url),
         PstrykCurrentCostSensor(buy_coordinator),
         PstrykMonthlyConsumptionSensor(cost_coordinator),
         PstrykMonthlyBillSensor(cost_coordinator),
+        PstrykPricePrognosis(prognosis_coordinator),
     ])
 
 
@@ -862,4 +877,65 @@ class PstrykMonthlyBillSensor(CoordinatorEntity, SensorEntity):
         if not monthly:
             return None
         return monthly.get("total_cost")
+
+
+class PstrykPricePrognosis(CoordinatorEntity, SensorEntity):
+    """Sensor exposing the full hourly price prognosis as an attribute object.
+
+    State: number of future price hours available.
+    Attribute 'prices': list of {start, end, tge_price, price_net, price_gross,
+                                  is_cheap, is_expensive} for every hour with a
+                                  known TGE price, ordered chronologically.
+    Updated every 30 minutes between 15:00 and 23:00 local time.
+    """
+
+    _attr_name = "Pstryk Price Prognosis"
+    _attr_unique_id = f"{DOMAIN}_price_prognosis"
+    _attr_native_unit_of_measurement = "h"
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_icon = "mdi:chart-line"
+
+    def __init__(self, coordinator: PstrykPrognosisCoordinator) -> None:
+        super().__init__(coordinator)
+
+    @property
+    def device_info(self):
+        return {
+            "identifiers": {(DOMAIN, "pstryk_energy")},
+            "name": "Pstryk Energy",
+            "manufacturer": "Pstryk",
+            "model": "Energy Price Monitor",
+        }
+
+    @property
+    def native_value(self):
+        """Return the number of future hours in the prognosis."""
+        prices = self._future_prices()
+        return len(prices) if prices is not None else None
+
+    @property
+    def extra_state_attributes(self):
+        prices = self._future_prices()
+        if prices is None:
+            return {}
+        fetched_at = self.coordinator.data.get("fetched_at") if self.coordinator.data else None
+        return {
+            "prices": prices,
+            "fetched_at": fetched_at,
+        }
+
+    def _future_prices(self):
+        if not self.coordinator.data:
+            return None
+        now_utc = dt_util.utcnow()
+        result = []
+        for entry in self.coordinator.data.get("prices", []):
+            start = dt_util.parse_datetime(entry["start"])
+            if start and dt_util.as_utc(start) >= now_utc:
+                result.append(entry)
+        return result
+
+    @property
+    def available(self) -> bool:
+        return self.coordinator.last_update_success and self.coordinator.data is not None
 
