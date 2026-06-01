@@ -149,8 +149,7 @@ async def async_setup_entry(
         PstrykCurrentCostSensor(buy_coordinator),
         PstrykMonthlyConsumptionSensor(cost_coordinator),
         PstrykMonthlyBillSensor(cost_coordinator),
-        PstrykPrognosisSensor(prognosis_coordinator, "tge_price"),
-        PstrykPrognosisSensor(prognosis_coordinator, "price_gross"),
+        PstrykFutureBuyPriceSensor(prognosis_coordinator),
     ])
 
 
@@ -880,19 +879,18 @@ class PstrykMonthlyBillSensor(CoordinatorEntity, SensorEntity):
         return monthly.get("total_cost")
 
 
-class PstrykPrognosisSensor(CoordinatorEntity, SensorEntity):
-    """Current-hour value for one prognosis field, with the full forecast in attributes."""
+class PstrykFutureBuyPriceSensor(CoordinatorEntity, SensorEntity):
+    """Next hour's gross buy price, with the full future prognosis in the prices attribute."""
 
+    _attr_name = "Pstryk Future Buy Price"
+    _attr_unique_id = f"{DOMAIN}_future_buy_price"
     _attr_native_unit_of_measurement = "PLN/kWh"
     _attr_device_class = SensorDeviceClass.MONETARY
     _attr_state_class = SensorStateClass.MEASUREMENT
     _attr_icon = "mdi:chart-line"
 
-    def __init__(self, coordinator: PstrykPrognosisCoordinator, field: str) -> None:
+    def __init__(self, coordinator: PstrykPrognosisCoordinator) -> None:
         super().__init__(coordinator)
-        self._field = field
-        self._attr_name = f"Pstryk Prognosis {field.replace('_', ' ').title()}"
-        self._attr_unique_id = f"{DOMAIN}_prognosis_{field}"
 
     @property
     def device_info(self):
@@ -903,30 +901,25 @@ class PstrykPrognosisSensor(CoordinatorEntity, SensorEntity):
             "model": "Energy Price Monitor",
         }
 
-    def _current_entry(self):
+    def _future_prices(self):
         if not self.coordinator.data:
-            return None
+            return []
         now_utc = dt_util.utcnow()
-        for entry in self.coordinator.data.get("prices", []):
-            start = dt_util.parse_datetime(entry["start"])
-            if not start:
-                continue
-            if dt_util.as_utc(start) <= now_utc < dt_util.as_utc(start) + timedelta(hours=1):
-                return entry
-        return None
+        return [
+            entry for entry in self.coordinator.data.get("prices", [])
+            if (start := dt_util.parse_datetime(entry["start"])) and dt_util.as_utc(start) > now_utc
+        ]
 
     @property
     def native_value(self):
-        entry = self._current_entry()
-        return entry.get(self._field) if entry else None
+        """Next hour's gross price."""
+        prices = self._future_prices()
+        return prices[0].get("price_gross") if prices else None
 
     @property
     def extra_state_attributes(self):
-        entry = self._current_entry()
-        return {
-            "start": entry["start"] if entry else None,
-            "prices": self.coordinator.data.get("prices", []) if self.coordinator.data else [],
-        }
+        prices = self._future_prices()
+        return {"prices": prices}
 
     @property
     def available(self) -> bool:
