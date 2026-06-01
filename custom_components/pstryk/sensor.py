@@ -10,7 +10,6 @@ from homeassistant.helpers.event import async_track_state_change_event
 from homeassistant.util import dt as dt_util
 from .update_coordinator import PstrykDataUpdateCoordinator
 from .energy_cost_coordinator import PstrykCostDataUpdateCoordinator
-from .prognosis_coordinator import PstrykPrognosisCoordinator
 from .api_client import PstrykAPIClient
 from .const import (
     DOMAIN,
@@ -130,27 +129,12 @@ async def async_setup_entry(
     cost_coordinator.schedule_hourly_update()
     cost_coordinator.schedule_midnight_update()
 
-    prognosis_coordinator = PstrykPrognosisCoordinator(hass, api_client)
-    try:
-        data = await prognosis_coordinator._async_update_data()
-        prognosis_coordinator.data = data
-        prognosis_coordinator.last_update_success = True
-    except Exception as err:
-        _LOGGER.error("Failed initial fetch for prognosis coordinator: %s", err)
-        prognosis_coordinator.last_update_success = False
-
-    hass.data[DOMAIN][f"{entry.entry_id}_prognosis"] = prognosis_coordinator
-    prognosis_coordinator.schedule_next_update()
-
     async_add_entities([
         PstrykPriceSensor(buy_coordinator, "buy", buy_top, buy_worst, entry.entry_id),
         PstrykPowerSensor(hass, meter_url),
         PstrykCurrentCostSensor(buy_coordinator),
         PstrykMonthlyConsumptionSensor(cost_coordinator),
         PstrykMonthlyBillSensor(cost_coordinator),
-        PstrykPeakMorningSensor(prognosis_coordinator),
-        PstrykPeakEveningSensor(prognosis_coordinator),
-        PstrykDipSensor(prognosis_coordinator),
     ])
 
 
@@ -878,77 +862,4 @@ class PstrykMonthlyBillSensor(CoordinatorEntity, SensorEntity):
         if not monthly:
             return None
         return monthly.get("total_cost")
-
-
-class _PstrykPrognosisSensor(CoordinatorEntity, SensorEntity):
-    """Base class for prognosis sensors (peak morning, peak evening, dip)."""
-
-    _attr_native_unit_of_measurement = "PLN/kWh"
-    _attr_device_class = SensorDeviceClass.MONETARY
-    _attr_state_class = None
-    _KEY: str = ""
-
-    def __init__(self, coordinator: PstrykPrognosisCoordinator) -> None:
-        super().__init__(coordinator)
-
-    @property
-    def device_info(self):
-        return {
-            "identifiers": {(DOMAIN, "pstryk_energy")},
-            "name": "Pstryk Energy",
-            "manufacturer": "Pstryk",
-            "model": "Energy Price Monitor",
-        }
-
-    @property
-    def native_value(self):
-        entry = self._entry()
-        return entry["price_gross"] if entry else None
-
-    @property
-    def extra_state_attributes(self):
-        entry = self._entry()
-        if not entry:
-            return {}
-        return {
-            "hour": entry["start"],
-            "date": self.coordinator.data.get("date"),
-        }
-
-    @property
-    def available(self) -> bool:
-        return (
-            self.coordinator.last_update_success
-            and self.coordinator.data is not None
-            and self.coordinator.data.get(self._KEY) is not None
-        )
-
-    def _entry(self):
-        if not self.coordinator.data:
-            return None
-        return self.coordinator.data.get(self._KEY)
-
-
-class PstrykPeakMorningSensor(_PstrykPrognosisSensor):
-    """Most expensive hour tomorrow between 06:00 and 13:00."""
-
-    _attr_name = "Pstryk Peak Morning"
-    _attr_unique_id = f"{DOMAIN}_peak_morning"
-    _KEY = "peak_morning"
-
-
-class PstrykPeakEveningSensor(_PstrykPrognosisSensor):
-    """Most expensive hour tomorrow between 16:00 and 22:00."""
-
-    _attr_name = "Pstryk Peak Evening"
-    _attr_unique_id = f"{DOMAIN}_peak_evening"
-    _KEY = "peak_evening"
-
-
-class PstrykDipSensor(_PstrykPrognosisSensor):
-    """Cheapest hour tomorrow across the full day."""
-
-    _attr_name = "Pstryk Dip Hour"
-    _attr_unique_id = f"{DOMAIN}_dip_hour"
-    _KEY = "dip"
 
