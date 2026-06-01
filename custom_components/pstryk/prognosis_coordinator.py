@@ -41,7 +41,7 @@ class PstrykPrognosisCoordinator(DataUpdateCoordinator):
             raise UpdateFailed(f"Error fetching prognosis data: {err}") from err
 
         frames = data.get("frames", [])
-        _LOGGER.info("Prognosis: received %d frames from API", len(frames))
+        _LOGGER.warning("Prognosis: received %d frames from API", len(frames))
 
         prices = []
         for frame in frames:
@@ -62,7 +62,7 @@ class PstrykPrognosisCoordinator(DataUpdateCoordinator):
                 continue
             prices.append({"start": start, "price_gross": price_gross})
 
-        _LOGGER.info("Prognosis: %d frames passed tge_price filter", len(prices))
+        _LOGGER.warning("Prognosis: %d frames passed tge_price filter", len(prices))
 
         if prices:
             self._inject_statistics(prices)
@@ -87,6 +87,7 @@ class PstrykPrognosisCoordinator(DataUpdateCoordinator):
             source="pstryk",
             statistic_id=STATISTIC_ID,
             unit_of_measurement="PLN/kWh",
+            unit_class=None,
             **mean_type_kwargs,
         )
         stats = []
