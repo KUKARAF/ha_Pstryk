@@ -66,8 +66,8 @@ class PstrykPrognosisCoordinator(DataUpdateCoordinator):
 
     def _inject_statistics(self, prices):
         """Push hourly price data into HA recorder as external statistics."""
-        from homeassistant.components.recorder import get_instance
         from homeassistant.components.recorder.models import StatisticData, StatisticMetaData
+        from homeassistant.components.recorder.statistics import async_add_external_statistics
 
         metadata = StatisticMetaData(
             has_mean=True,
@@ -84,7 +84,7 @@ class PstrykPrognosisCoordinator(DataUpdateCoordinator):
                 continue
             stats.append(StatisticData(start=dt_util.as_utc(dt), mean=p["price_gross"]))
 
-        get_instance(self.hass).async_add_external_statistics(metadata, stats)
+        async_add_external_statistics(self.hass, metadata, stats)
         _LOGGER.debug("Injected %d statistic entries for %s", len(stats), STATISTIC_ID)
 
     def _next_poll_time(self, now):
