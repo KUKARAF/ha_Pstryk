@@ -961,9 +961,14 @@ class PstrykNextCheapestPriceSensor(CoordinatorEntity, SensorEntity):
     @property
     def extra_state_attributes(self):
         result = self.coordinator.price_cache.get_cheapest(dt_util.now())
+        window = self.coordinator.price_cache.next_24h_window(dt_util.now())
+        series = ",".join(f"{price:.3f}" for _, price in window)
         if result is None:
-            return {}
-        return {"start": dt_util.as_local(dt_util.parse_datetime(result[0])).isoformat()}
+            return {"series": series}
+        return {
+            "start": dt_util.as_local(dt_util.parse_datetime(result[0])).isoformat(),
+            "series": series,
+        }
 
     @property
     def available(self):
