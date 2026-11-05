@@ -13,6 +13,7 @@ from homeassistant.util import dt as dt_util
 from .update_coordinator import PstrykDataUpdateCoordinator
 from .energy_cost_coordinator import PstrykCostDataUpdateCoordinator
 from .tge_coordinator import TGECoordinator
+from .price_cache import PstrykPriceCache
 from .api_client import PstrykAPIClient
 from .const import (
     DOMAIN,
@@ -95,9 +96,18 @@ async def async_setup_entry(
     else:
         api_client = hass.data[DOMAIN][api_client_key]
 
+    # Create shared rolling price cache (or reuse existing one)
+    price_cache_key = f"{entry.entry_id}_price_cache"
+    if price_cache_key not in hass.data[DOMAIN]:
+        price_cache = PstrykPriceCache(hass)
+        hass.data[DOMAIN][price_cache_key] = price_cache
+    else:
+        price_cache = hass.data[DOMAIN][price_cache_key]
+    await price_cache.async_load_cache()
+
     # Create buy price coordinator
     buy_coordinator = PstrykDataUpdateCoordinator(
-        hass, api_client, "buy", mqtt_48h_mode, retry_attempts, retry_delay
+        hass, api_client, "buy", mqtt_48h_mode, retry_attempts, retry_delay, price_cache
     )
     try:
         data = await buy_coordinator._async_update_data()
@@ -143,6 +153,8 @@ async def async_setup_entry(
         PstrykMonthlyConsumptionSensor(cost_coordinator),
         PstrykMonthlyBillSensor(cost_coordinator),
         PstrykTGECheapestHourSensor(tge_coordinator),
+        PstrykNextCheapestPriceSensor(buy_coordinator),
+        PstrykNextMostExpensivePriceSensor(buy_coordinator),
     ])
 
 
@@ -915,5 +927,93 @@ class PstrykTGECheapestHourSensor(CoordinatorEntity, SensorEntity):
     def available(self):
         return self.coordinator.last_update_success and bool(
             (self.coordinator.data or {}).get("prices_tomorrow")
+        )
+
+
+class PstrykNextCheapestPriceSensor(CoordinatorEntity, SensorEntity):
+    """Next cheapest electricity price in the rolling 24h window."""
+
+    _attr_name = "Pstryk Next Cheapest Price 24h"
+    _attr_unique_id = f"{DOMAIN}_next_cheapest_price_24h"
+    _attr_native_unit_of_measurement = "PLN/kWh"
+    _attr_device_class = SensorDeviceClass.MONETARY
+    _attr_state_class = None
+
+    def __init__(self, coordinator: PstrykDataUpdateCoordinator) -> None:
+        super().__init__(coordinator)
+
+    @property
+    def device_info(self):
+        return {
+            "identifiers": {(DOMAIN, "pstryk_energy")},
+            "name": "Pstryk Energy",
+            "manufacturer": "Pstryk",
+            "model": "Energy Price Monitor",
+        }
+
+    @property
+    def native_value(self):
+        result = self.coordinator.price_cache.get_cheapest(dt_util.now())
+        if result is None:
+            return None
+        return result[1]
+
+    @property
+    def extra_state_attributes(self):
+        result = self.coordinator.price_cache.get_cheapest(dt_util.now())
+        if result is None:
+            return {}
+        return {"start": dt_util.as_local(dt_util.parse_datetime(result[0])).isoformat()}
+
+    @property
+    def available(self):
+        return (
+            self.coordinator.last_update_success
+            and self.coordinator.price_cache is not None
+            and self.coordinator.price_cache.get_cheapest(dt_util.now()) is not None
+        )
+
+
+class PstrykNextMostExpensivePriceSensor(CoordinatorEntity, SensorEntity):
+    """Next most expensive electricity price in the rolling 24h window."""
+
+    _attr_name = "Pstryk Next Most Expensive Price 24h"
+    _attr_unique_id = f"{DOMAIN}_next_most_expensive_price_24h"
+    _attr_native_unit_of_measurement = "PLN/kWh"
+    _attr_device_class = SensorDeviceClass.MONETARY
+    _attr_state_class = None
+
+    def __init__(self, coordinator: PstrykDataUpdateCoordinator) -> None:
+        super().__init__(coordinator)
+
+    @property
+    def device_info(self):
+        return {
+            "identifiers": {(DOMAIN, "pstryk_energy")},
+            "name": "Pstryk Energy",
+            "manufacturer": "Pstryk",
+            "model": "Energy Price Monitor",
+        }
+
+    @property
+    def native_value(self):
+        result = self.coordinator.price_cache.get_most_expensive(dt_util.now())
+        if result is None:
+            return None
+        return result[1]
+
+    @property
+    def extra_state_attributes(self):
+        result = self.coordinator.price_cache.get_most_expensive(dt_util.now())
+        if result is None:
+            return {}
+        return {"start": dt_util.as_local(dt_util.parse_datetime(result[0])).isoformat()}
+
+    @property
+    def available(self):
+        return (
+            self.coordinator.last_update_success
+            and self.coordinator.price_cache is not None
+            and self.coordinator.price_cache.get_most_expensive(dt_util.now()) is not None
         )
 

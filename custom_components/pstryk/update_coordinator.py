@@ -14,9 +14,14 @@ from .const import (
     PRICING_ENDPOINT,
     DOMAIN,
     DEFAULT_RETRY_ATTEMPTS,
-    DEFAULT_RETRY_DELAY
+    DEFAULT_RETRY_DELAY,
+    CONF_MQTT_TOPIC_BUY,
+    CONF_MQTT_TOPIC_SELL,
+    DEFAULT_MQTT_TOPIC_BUY,
+    DEFAULT_MQTT_TOPIC_SELL,
 )
 from .api_client import PstrykAPIClient
+from .mqtt_common import publish_mqtt_prices
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -33,12 +38,13 @@ def convert_price(value):
 class PstrykDataUpdateCoordinator(DataUpdateCoordinator):
     """Coordinator to fetch both current price and today's table."""
 
-    def __init__(self, hass, api_client: PstrykAPIClient, price_type, mqtt_48h_mode=False, retry_attempts=None, retry_delay=None):
+    def __init__(self, hass, api_client: PstrykAPIClient, price_type, mqtt_48h_mode=False, retry_attempts=None, retry_delay=None, price_cache=None):
         """Initialize the coordinator."""
         self.hass = hass
         self.api_client = api_client
         self.price_type = price_type
         self.mqtt_48h_mode = mqtt_48h_mode
+        self.price_cache = price_cache
         self._unsub_hourly = None
         self._unsub_midnight = None
         self._unsub_afternoon = None
@@ -96,7 +102,7 @@ class PstrykDataUpdateCoordinator(DataUpdateCoordinator):
                         return None
 
                     return data
-            except Exception as err:
+            except (OSError, ValueError) as err:
                 _LOGGER.warning("Failed to read cache for %s: %s", self.price_type, err)
                 return None
 
@@ -111,7 +117,7 @@ class PstrykDataUpdateCoordinator(DataUpdateCoordinator):
                 with open(self._cache_file, "w", encoding="utf-8") as f:
                     json.dump(data, f, indent=2)
                 _LOGGER.debug("Saved cache for %s to %s", self.price_type, self._cache_file)
-            except Exception as err:
+            except (OSError, TypeError) as err:
                 _LOGGER.warning("Failed to write cache for %s: %s", self.price_type, err)
 
         await asyncio.to_thread(_write)
@@ -191,14 +197,12 @@ class PstrykDataUpdateCoordinator(DataUpdateCoordinator):
                     _LOGGER.debug("Coordinators not yet initialized, skipping MQTT publish for now")
                     return
 
-                from .const import CONF_MQTT_TOPIC_BUY, CONF_MQTT_TOPIC_SELL, DEFAULT_MQTT_TOPIC_BUY, DEFAULT_MQTT_TOPIC_SELL
                 entry = self.hass.config_entries.async_get_entry(entry_id)
                 mqtt_topic_buy = entry.options.get(CONF_MQTT_TOPIC_BUY, DEFAULT_MQTT_TOPIC_BUY)
                 mqtt_topic_sell = entry.options.get(CONF_MQTT_TOPIC_SELL, DEFAULT_MQTT_TOPIC_SELL)
 
                 await asyncio.sleep(5)
 
-                from .mqtt_common import publish_mqtt_prices
                 success = await publish_mqtt_prices(self.hass, entry_id, mqtt_topic_buy, mqtt_topic_sell)
 
                 if success:
@@ -235,7 +239,7 @@ class PstrykDataUpdateCoordinator(DataUpdateCoordinator):
                 self._translations = await async_get_translations(
                     self.hass, self.hass.config.language, DOMAIN, ["debug"]
                 )
-            except Exception as ex:
+            except (OSError, ValueError, LookupError) as ex:
                 _LOGGER.warning("Failed to load translations for coordinator: %s", ex)
 
             # Use shared API client
@@ -266,6 +270,9 @@ class PstrykDataUpdateCoordinator(DataUpdateCoordinator):
                 local_start = dt_util.as_local(start).strftime("%Y-%m-%dT%H:%M:%S")
                 prices.append({"start": local_start, "price": val})
 
+            if self.price_cache is not None:
+                self.price_cache.update(prices)
+
             today_local = dt_util.now().strftime("%Y-%m-%d")
             prices_today = [p for p in prices if p["start"].startswith(today_local)]
 
@@ -295,7 +302,7 @@ class PstrykDataUpdateCoordinator(DataUpdateCoordinator):
             _LOGGER.error("Failed to fetch %s data from API: %s", self.price_type, err)
             raise
 
-        except Exception as err:
+        except (ValueError, KeyError, TypeError, AttributeError) as err:
             error_msg = self._translations.get(
                 "debug.unexpected_error",
                 "Unexpected error fetching {price_type} data: {error}"
@@ -355,13 +362,13 @@ class PstrykDataUpdateCoordinator(DataUpdateCoordinator):
                             }
                             await self._save_cache(invalid_cache)
                             _LOGGER.warning("Marked old cache as INVALID for %s", self.price_type)
-                        except Exception as cache_err:
+                        except (OSError, TypeError) as cache_err:
                             _LOGGER.error("Failed to mark cache as invalid: %s", cache_err)
 
                         # Try to fetch fresh data
                         try:
                             await self.async_request_refresh()
-                        except Exception as fetch_err:
+                        except (UpdateFailed, OSError, ValueError, KeyError, TypeError, AttributeError) as fetch_err:
                             _LOGGER.error("Failed to fetch fresh data for %s: %s - sensors UNAVAILABLE",
                                         self.price_type, fetch_err)
                             self.data = None
@@ -369,7 +376,7 @@ class PstrykDataUpdateCoordinator(DataUpdateCoordinator):
 
                         self.schedule_hourly_update()
                         return
-                except Exception as err:
+                except (AttributeError, IndexError, ValueError) as err:
                     _LOGGER.debug("Could not parse cache date: %s", err)
 
             # Cache is fresh, use it
@@ -385,7 +392,7 @@ class PstrykDataUpdateCoordinator(DataUpdateCoordinator):
                           self.price_type)
             try:
                 await self.async_request_refresh()
-            except Exception as err:
+            except (UpdateFailed, OSError, ValueError, KeyError, TypeError, AttributeError) as err:
                 _LOGGER.error("Failed to fetch data for %s: %s - sensors UNAVAILABLE",
                             self.price_type, err)
                 self.data = None
@@ -416,7 +423,7 @@ class PstrykDataUpdateCoordinator(DataUpdateCoordinator):
 
         try:
             await self.async_request_refresh()
-        except Exception as err:
+        except (UpdateFailed, OSError, ValueError, KeyError, TypeError, AttributeError) as err:
             # Midnight fetch FAILED - mark cache as invalid and set sensors unavailable
             _LOGGER.error("Midnight fetch failed for %s: %s - marking cache invalid and setting sensors unavailable",
                          self.price_type, err)
@@ -431,7 +438,7 @@ class PstrykDataUpdateCoordinator(DataUpdateCoordinator):
                 }
                 await self._save_cache(invalid_cache)
                 _LOGGER.warning("Marked cache as INVALID for %s", self.price_type)
-            except Exception as cache_err:
+            except (OSError, TypeError) as cache_err:
                 _LOGGER.error("Failed to mark cache as invalid: %s", cache_err)
 
             # Set coordinator data to None (sensors will be unavailable)
