@@ -1,15 +1,18 @@
 """Sensor platform for Pstryk Energy integration."""
 import logging
+import json
+import os
 from datetime import timedelta
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.components.sensor import SensorEntity, SensorStateClass, SensorDeviceClass
-from homeassistant.helpers.update_coordinator import CoordinatorEntity
+from homeassistant.helpers.update_coordinator import CoordinatorEntity, UpdateFailed
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.event import async_track_state_change_event
 from homeassistant.util import dt as dt_util
 from .update_coordinator import PstrykDataUpdateCoordinator
 from .energy_cost_coordinator import PstrykCostDataUpdateCoordinator
+from .tge_coordinator import TGECoordinator
 from .api_client import PstrykAPIClient
 from .const import (
     DOMAIN,
@@ -39,14 +42,12 @@ def get_integration_version(hass: HomeAssistant) -> str:
         return _VERSION_CACHE
 
     try:
-        import json
-        import os
         manifest_path = os.path.join(os.path.dirname(__file__), "manifest.json")
         with open(manifest_path, "r") as f:
             manifest = json.load(f)
             _VERSION_CACHE = manifest.get("version", "unknown")
             return _VERSION_CACHE
-    except Exception as ex:
+    except OSError as ex:
         _LOGGER.warning("Failed to read version from manifest.json: %s", ex)
         return "unknown"
 
@@ -72,7 +73,7 @@ async def async_setup_entry(
             _TRANSLATIONS_CACHE = await async_get_translations(
                 hass, hass.config.language, DOMAIN, ["entity", "debug"]
             )
-        except Exception as ex:
+        except (OSError, ValueError, LookupError) as ex:
             _LOGGER.warning("Failed to load translations: %s", ex)
             _TRANSLATIONS_CACHE = {}
 
@@ -102,7 +103,7 @@ async def async_setup_entry(
         data = await buy_coordinator._async_update_data()
         buy_coordinator.data = data
         buy_coordinator.last_update_success = True
-    except Exception as err:
+    except UpdateFailed as err:
         _LOGGER.error("Failed initial fetch for buy coordinator: %s", err)
         buy_coordinator.last_update_success = False
 
@@ -121,7 +122,7 @@ async def async_setup_entry(
         data = await cost_coordinator._async_update_data()
         cost_coordinator.data = data
         cost_coordinator.last_update_success = True
-    except Exception as err:
+    except UpdateFailed as err:
         _LOGGER.error("Failed initial fetch for cost coordinator: %s", err)
         cost_coordinator.last_update_success = False
 
@@ -129,12 +130,19 @@ async def async_setup_entry(
     cost_coordinator.schedule_hourly_update()
     cost_coordinator.schedule_midnight_update()
 
+    # TGE coordinator — tomorrow's hourly prices, fetched daily at 15:30
+    tge_coordinator = TGECoordinator(hass, api_client, retry_attempts, retry_delay)
+    await tge_coordinator.async_load_cache()
+    hass.data[DOMAIN][f"{entry.entry_id}_tge"] = tge_coordinator
+    tge_coordinator.schedule_next_update()
+
     async_add_entities([
         PstrykPriceSensor(buy_coordinator, "buy", buy_top, buy_worst, entry.entry_id),
         PstrykPowerSensor(hass, meter_url),
         PstrykCurrentCostSensor(buy_coordinator),
         PstrykMonthlyConsumptionSensor(cost_coordinator),
         PstrykMonthlyBillSensor(cost_coordinator),
+        PstrykTGECheapestHourSensor(tge_coordinator),
     ])
 
 
@@ -196,7 +204,7 @@ class PstrykPriceSensor(CoordinatorEntity, SensorEntity):
                 
                 if price_datetime_utc <= now_utc < price_end_utc:
                     return price_entry.get("price")
-            except Exception as e:
+            except (ValueError, AttributeError) as e:
                 _LOGGER.error("Error determining current price: %s", str(e))
                 
         return None
@@ -253,7 +261,7 @@ class PstrykPriceSensor(CoordinatorEntity, SensorEntity):
                         price_found = price_data.get("price")
                         _LOGGER.debug("Found price for %s in today's list: %s", next_hour.strftime("%Y-%m-%d %H:%M:%S"), price_found)
                         return price_found
-                except Exception as e:
+                except (ValueError, AttributeError) as e:
                     error_msg = _TRANSLATIONS_CACHE.get(
                         "debug.error_processing_date", 
                         "Error processing date: {error}"
@@ -280,7 +288,7 @@ class PstrykPriceSensor(CoordinatorEntity, SensorEntity):
                         price_found = price_data.get("price")
                         _LOGGER.debug("Found price for %s in full 48h list: %s", next_hour.strftime("%Y-%m-%d %H:%M:%S"), price_found)
                         return price_found
-                except Exception as e:
+                except (ValueError, AttributeError) as e:
                     full_list_error_msg = _TRANSLATIONS_CACHE.get(
                         "debug.error_processing_full_list", 
                         "Error processing date for full list: {error}"
@@ -498,7 +506,7 @@ class PstrykPriceSensor(CoordinatorEntity, SensorEntity):
                 _LOGGER.debug("No prices found between sunrise and sunset")
                 return None
                 
-        except Exception as e:
+        except (ValueError, AttributeError, TypeError) as e:
             _LOGGER.error(f"Error calculating sunrise/sunset average: {e}")
             return None
         
@@ -729,7 +737,7 @@ class PstrykPowerSensor(SensorEntity):
                     self._attr_native_value = s["value"]
                     return
             _LOGGER.warning("activePower sensor not found in meter response")
-        except Exception as err:
+        except (OSError, ValueError, KeyError) as err:
             _LOGGER.error("Failed to fetch power from local meter: %s", err)
             self._attr_native_value = None
 
@@ -783,7 +791,7 @@ class PstrykCurrentCostSensor(CoordinatorEntity, SensorEntity):
                 price_datetime_utc = dt_util.as_utc(price_datetime)
                 if price_datetime_utc <= now_utc < price_datetime_utc + timedelta(hours=1):
                     return price_entry.get("price")
-            except Exception:
+            except (ValueError, AttributeError):
                 pass
         return None
 
@@ -862,4 +870,50 @@ class PstrykMonthlyBillSensor(CoordinatorEntity, SensorEntity):
         if not monthly:
             return None
         return monthly.get("total_cost")
+
+
+class PstrykTGECheapestHourSensor(CoordinatorEntity, SensorEntity):
+    """Tomorrow's cheapest electricity hour from TGE day-ahead prices."""
+
+    _attr_name = "Pstryk TGE Cheapest Hour Tomorrow"
+    _attr_unique_id = f"{DOMAIN}_tge_cheapest_hour"
+    _attr_native_unit_of_measurement = "PLN/kWh"
+    _attr_device_class = SensorDeviceClass.MONETARY
+    _attr_state_class = None
+
+    def __init__(self, coordinator: TGECoordinator) -> None:
+        super().__init__(coordinator)
+
+    @property
+    def device_info(self):
+        return {
+            "identifiers": {(DOMAIN, "pstryk_energy")},
+            "name": "Pstryk Energy",
+            "manufacturer": "Pstryk",
+            "model": "Energy Price Monitor",
+        }
+
+    @property
+    def native_value(self):
+        prices = (self.coordinator.data or {}).get("prices_tomorrow")
+        if not prices:
+            return None
+        return min(prices, key=lambda p: p["price_gross"])["price_gross"]
+
+    @property
+    def extra_state_attributes(self):
+        prices = (self.coordinator.data or {}).get("prices_tomorrow")
+        if not prices:
+            return {}
+        cheapest = min(prices, key=lambda p: p["price_gross"])
+        return {
+            "hour": cheapest["start"],
+            "date": (self.coordinator.data or {}).get("date"),
+        }
+
+    @property
+    def available(self):
+        return self.coordinator.last_update_success and bool(
+            (self.coordinator.data or {}).get("prices_tomorrow")
+        )
 
