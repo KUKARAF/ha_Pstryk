@@ -14,6 +14,7 @@ from .update_coordinator import PstrykDataUpdateCoordinator
 from .energy_cost_coordinator import PstrykCostDataUpdateCoordinator
 from .tge_coordinator import TGECoordinator
 from .full_average_coordinator import PstrykFullAveragePriceCoordinator
+from .full_average_monthly_coordinator import PstrykFullAverageMonthlyPriceCoordinator
 from .price_cache import PstrykPriceCache
 from .api_client import PstrykAPIClient
 from .const import (
@@ -151,6 +152,11 @@ async def async_setup_entry(
     await full_average_coordinator.async_config_entry_first_refresh()
     hass.data[DOMAIN][f"{entry.entry_id}_full_average"] = full_average_coordinator
 
+    # Full average monthly coordinator — current month's server-computed average buy price, hourly refresh
+    full_average_monthly_coordinator = PstrykFullAverageMonthlyPriceCoordinator(hass, api_client, retry_attempts, retry_delay)
+    await full_average_monthly_coordinator.async_config_entry_first_refresh()
+    hass.data[DOMAIN][f"{entry.entry_id}_full_average_monthly"] = full_average_monthly_coordinator
+
     async_add_entities([
         PstrykPriceSensor(buy_coordinator, "buy", buy_top, buy_worst, entry.entry_id),
         PstrykPowerSensor(hass, meter_url),
@@ -161,6 +167,7 @@ async def async_setup_entry(
         PstrykNextCheapestPriceSensor(buy_coordinator),
         PstrykNextMostExpensivePriceSensor(buy_coordinator),
         PstrykFullAveragePriceSensor(full_average_coordinator),
+        PstrykFullAverageMonthlyPriceSensor(full_average_monthly_coordinator),
     ])
 
 
@@ -1039,6 +1046,38 @@ class PstrykFullAveragePriceSensor(CoordinatorEntity, SensorEntity):
     _attr_state_class = None
 
     def __init__(self, coordinator: PstrykFullAveragePriceCoordinator) -> None:
+        super().__init__(coordinator)
+
+    @property
+    def device_info(self):
+        return {
+            "identifiers": {(DOMAIN, "pstryk_energy")},
+            "name": "Pstryk Energy",
+            "manufacturer": "Pstryk",
+            "model": "Energy Price Monitor",
+        }
+
+    @property
+    def native_value(self):
+        if self.coordinator.data:
+            return self.coordinator.data.get("average_price")
+        return None
+
+    @property
+    def available(self):
+        return self.coordinator.last_update_success
+
+
+class PstrykFullAverageMonthlyPriceSensor(CoordinatorEntity, SensorEntity):
+    """Current month's server-computed average gross buy price."""
+
+    _attr_name = "Pstryk Full Average Monthly Price"
+    _attr_unique_id = f"{DOMAIN}_full_average_monthly_price"
+    _attr_native_unit_of_measurement = "PLN/kWh"
+    _attr_device_class = SensorDeviceClass.MONETARY
+    _attr_state_class = None
+
+    def __init__(self, coordinator: PstrykFullAverageMonthlyPriceCoordinator) -> None:
         super().__init__(coordinator)
 
     @property

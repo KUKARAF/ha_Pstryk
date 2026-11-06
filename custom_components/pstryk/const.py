@@ -16,6 +16,12 @@ DAILY_AVERAGE_ENDPOINT = (
     "&resolution=day&window_start={start}&window_end={end}"
 )
 
+# Server-computed monthly average pricing endpoint (current month window).
+MONTHLY_AVERAGE_ENDPOINT = (
+    "meter-data/unified-metrics/?metrics=pricing"
+    "&resolution=month&window_start={start}&window_end={end}"
+)
+
 # Unified meter metrics endpoint replacing deprecated meter-data energy-cost and
 # energy-usage endpoints.
 UNIFIED_METRICS_ENDPOINT = (
