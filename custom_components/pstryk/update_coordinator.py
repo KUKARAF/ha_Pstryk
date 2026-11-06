@@ -420,6 +420,7 @@ class PstrykDataUpdateCoordinator(DataUpdateCoordinator):
         """Handle midnight update - FETCH FRESH DATA from API."""
         _LOGGER.info("Midnight update for %s - fetching fresh data from API", self.price_type)
         self._has_tomorrow = False  # Reset flag for new day
+        self.schedule_afternoon_update()  # Re-arm the hourly afternoon-check cycle for the new day
 
         try:
             await self.async_request_refresh()
@@ -449,40 +450,32 @@ class PstrykDataUpdateCoordinator(DataUpdateCoordinator):
         self.schedule_midnight_update()
 
     def schedule_afternoon_update(self):
-        """Schedule frequent updates between 14:00-15:00 for 48h mode."""
+        """Schedule the next hourly check (starting 13:00) for tomorrow's prices.
+
+        Runs unconditionally (not gated behind mqtt_48h_mode) since the
+        price-cache/price-ring feature also depends on knowing when
+        tomorrow's prices become available. Checks hourly starting at 13:00
+        local time and keeps retrying hour after hour until either
+        self._has_tomorrow becomes True (at which point the chain stops,
+        see _handle_afternoon_update) or the day rolls over to midnight,
+        where _handle_midnight_update takes over and re-arms this cycle for
+        the new day.
+        """
         if self._unsub_afternoon:
             self._unsub_afternoon()
             self._unsub_afternoon = None
 
-        if not self.mqtt_48h_mode:
-            _LOGGER.debug("Afternoon updates not scheduled for %s - 48h mode is disabled", self.price_type)
-            return
-
         now = dt_util.now()
 
-        if now.hour < 14:
-            next_check = now.replace(hour=14, minute=0, second=0, microsecond=0)
-        elif now.hour == 14:
-            current_minutes = now.minute
-            if current_minutes < 15:
-                next_minutes = 15
-            elif current_minutes < 30:
-                next_minutes = 30
-            elif current_minutes < 45:
-                next_minutes = 45
-            else:
-                next_check = now.replace(hour=15, minute=0, second=0, microsecond=0)
-                next_minutes = None
-
-            if next_minutes is not None:
-                next_check = now.replace(minute=next_minutes, second=0, microsecond=0)
+        if now.hour < 13:
+            next_check = now.replace(hour=13, minute=0, second=0, microsecond=0)
         else:
-            next_check = (now + timedelta(days=1)).replace(hour=14, minute=0, second=0, microsecond=0)
+            next_check = now + timedelta(hours=1)
 
         if next_check <= now:
-            next_check = next_check + timedelta(minutes=15)
+            next_check = next_check + timedelta(hours=1)
 
-        _LOGGER.info("Scheduling afternoon update check for %s at %s (48h mode, checking every 15min between 14:00-15:00)",
+        _LOGGER.info("Scheduling afternoon update check for %s at %s (hourly checks starting 13:00 until tomorrow prices are found)",
                      self.price_type, next_check.strftime("%Y-%m-%d %H:%M:%S"))
 
         self._unsub_afternoon = async_track_point_in_time(
@@ -490,21 +483,21 @@ class PstrykDataUpdateCoordinator(DataUpdateCoordinator):
         )
 
     async def _handle_afternoon_update(self, _):
-        """Handle afternoon update - check for tomorrow prices (14:00-15:00)."""
+        """Handle hourly afternoon check - look for tomorrow prices.
+
+        Fires hourly starting at 13:00. Stops rescheduling itself once
+        self._has_tomorrow is True - no need to keep burning a timer/API
+        call for the rest of the day once we have what we need. The cycle
+        resumes the next day when _handle_midnight_update resets
+        self._has_tomorrow and calls schedule_afternoon_update() again.
+        """
         now = dt_util.now()
 
-        # IMPORTANT: Only run if 48h mode is enabled
-        if not self.mqtt_48h_mode:
-            _LOGGER.debug("Skipping afternoon update for %s (48h mode disabled)",
-                         self.price_type)
-            self.schedule_afternoon_update()
-            return
-
-        # If we already have tomorrow, skip fetch
+        # Safety check: shouldn't normally happen since we stop rescheduling
+        # once found, but guard against it anyway.
         if self._has_tomorrow:
-            _LOGGER.debug("Already have tomorrow for %s, skipping afternoon fetch",
+            _LOGGER.debug("Already have tomorrow for %s, not rescheduling afternoon check",
                          self.price_type)
-            self.schedule_afternoon_update()
             return
 
         # Fetch and check for tomorrow prices
@@ -512,9 +505,11 @@ class PstrykDataUpdateCoordinator(DataUpdateCoordinator):
                     self.price_type, now.strftime("%H:%M"))
         await self.async_request_refresh()
 
-        # If we found tomorrow, log it
+        # If we found tomorrow, log it and stop - no further rescheduling
         if self._has_tomorrow:
             _LOGGER.info("✓ Found tomorrow prices for %s at %s!",
                         self.price_type, now.strftime("%H:%M"))
+            return
 
+        # Still not found - schedule the next hourly attempt
         self.schedule_afternoon_update()

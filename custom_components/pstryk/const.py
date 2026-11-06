@@ -10,6 +10,12 @@ PRICING_ENDPOINT = (
     "&resolution=hour&window_start={start}&window_end={end}"
 )
 
+# Server-computed daily average pricing endpoint (today's window).
+DAILY_AVERAGE_ENDPOINT = (
+    "meter-data/unified-metrics/?metrics=pricing"
+    "&resolution=day&window_start={start}&window_end={end}"
+)
+
 # Unified meter metrics endpoint replacing deprecated meter-data energy-cost and
 # energy-usage endpoints.
 UNIFIED_METRICS_ENDPOINT = (

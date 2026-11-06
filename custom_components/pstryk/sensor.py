@@ -13,6 +13,7 @@ from homeassistant.util import dt as dt_util
 from .update_coordinator import PstrykDataUpdateCoordinator
 from .energy_cost_coordinator import PstrykCostDataUpdateCoordinator
 from .tge_coordinator import TGECoordinator
+from .full_average_coordinator import PstrykFullAveragePriceCoordinator
 from .price_cache import PstrykPriceCache
 from .api_client import PstrykAPIClient
 from .const import (
@@ -120,8 +121,7 @@ async def async_setup_entry(
     hass.data[DOMAIN][buy_key] = buy_coordinator
     buy_coordinator.schedule_hourly_update()
     buy_coordinator.schedule_midnight_update()
-    if mqtt_48h_mode:
-        buy_coordinator.schedule_afternoon_update()
+    buy_coordinator.schedule_afternoon_update()
 
     # Create cost coordinator (monthly/daily data for billing sensors)
     cost_key = f"{entry.entry_id}_cost"
@@ -146,6 +146,11 @@ async def async_setup_entry(
     hass.data[DOMAIN][f"{entry.entry_id}_tge"] = tge_coordinator
     tge_coordinator.schedule_next_update()
 
+    # Full average coordinator — today's server-computed average buy price, hourly refresh
+    full_average_coordinator = PstrykFullAveragePriceCoordinator(hass, api_client, retry_attempts, retry_delay)
+    await full_average_coordinator.async_config_entry_first_refresh()
+    hass.data[DOMAIN][f"{entry.entry_id}_full_average"] = full_average_coordinator
+
     async_add_entities([
         PstrykPriceSensor(buy_coordinator, "buy", buy_top, buy_worst, entry.entry_id),
         PstrykPowerSensor(hass, meter_url),
@@ -155,6 +160,7 @@ async def async_setup_entry(
         PstrykTGECheapestHourSensor(tge_coordinator),
         PstrykNextCheapestPriceSensor(buy_coordinator),
         PstrykNextMostExpensivePriceSensor(buy_coordinator),
+        PstrykFullAveragePriceSensor(full_average_coordinator),
     ])
 
 
@@ -1021,4 +1027,36 @@ class PstrykNextMostExpensivePriceSensor(CoordinatorEntity, SensorEntity):
             and self.coordinator.price_cache is not None
             and self.coordinator.price_cache.get_most_expensive(dt_util.now()) is not None
         )
+
+
+class PstrykFullAveragePriceSensor(CoordinatorEntity, SensorEntity):
+    """Today's server-computed average gross buy price."""
+
+    _attr_name = "Pstryk Full Average Price"
+    _attr_unique_id = f"{DOMAIN}_full_average_price"
+    _attr_native_unit_of_measurement = "PLN/kWh"
+    _attr_device_class = SensorDeviceClass.MONETARY
+    _attr_state_class = None
+
+    def __init__(self, coordinator: PstrykFullAveragePriceCoordinator) -> None:
+        super().__init__(coordinator)
+
+    @property
+    def device_info(self):
+        return {
+            "identifiers": {(DOMAIN, "pstryk_energy")},
+            "name": "Pstryk Energy",
+            "manufacturer": "Pstryk",
+            "model": "Energy Price Monitor",
+        }
+
+    @property
+    def native_value(self):
+        if self.coordinator.data:
+            return self.coordinator.data.get("average_price")
+        return None
+
+    @property
+    def available(self):
+        return self.coordinator.last_update_success
 
